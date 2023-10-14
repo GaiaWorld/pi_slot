@@ -22,7 +22,7 @@ pi_slot = "0.1"
 A short example:
 
 ```rust
-use slotmap::{SlotMap, SecondaryMap};
+use slotmap::SlotMap;
 
 let sm = SlotMap::new();
 let foo = sm.insert("foo");  // Key generated on insert.
