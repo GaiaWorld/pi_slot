@@ -354,7 +354,7 @@ impl<K: Key, V: Debug> Debug for SlotMap<K, V> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("SlotMap")
             .field("alloter", &self.alloter)
-            .field("map", &self.map)
+            .field("map", &KeyMapFormatter::new(&self.map, self.alloter.max() as usize))
             .finish()
     }
 }
@@ -392,7 +392,7 @@ impl<K: Key, V> KeyMap<K, V> {
     pub fn contains_key(&self, k: K) -> bool {
         let kd = k.data();
         match self.arr.get(kd.index() as usize) {
-            Some(s) => s.ver() == kd.version(),
+            Some(s) => s.ver(Ordering::Relaxed) == kd.version(),
             None => false,
         }
     }
@@ -415,7 +415,7 @@ impl<K: Key, V> KeyMap<K, V> {
     #[inline(always)]
     pub fn insert(&self, k: K, v: V) -> std::result::Result<Option<V>, V> {
         let kd = k.data();
-        let e = self.arr.load_alloc(kd.index() as usize);
+        let e = self.arr.load_alloc(kd.index() as usize, 1);
         Self::update(kd, v, e)
     }
     /// Removes a key from the slot map, returning the value at the key if the
@@ -435,10 +435,10 @@ impl<K: Key, V> KeyMap<K, V> {
         let kd = k.data();
         match self.arr.load(kd.index() as usize) {
             Some(e) => {
-                let v = e.ver();
+                let v = e.ver(Ordering::Relaxed);
                 if v == kd.version() {
                     let r = unsafe { Some(e.take()) };
-                    e.set_ver(v + 1);
+                    e.set_ver(v + 1, Ordering::Relaxed);
                     r
                 } else {
                     None
@@ -462,7 +462,7 @@ impl<K: Key, V> KeyMap<K, V> {
     pub fn get(&self, k: K) -> Option<&V> {
         let kd = k.data();
         match self.arr.get(kd.index() as usize) {
-            Some(s) if s.ver() == kd.version() => Some(unsafe { s.get_unchecked() }),
+            Some(s) if s.ver(Ordering::Acquire) == kd.version() => Some(unsafe { s.get_unchecked() }),
             _ => None,
         }
     }
@@ -507,7 +507,7 @@ impl<K: Key, V> KeyMap<K, V> {
     pub fn get_mut(&mut self, k: K) -> Option<&mut V> {
         let kd = k.data();
         match self.arr.get_mut(kd.index() as usize) {
-            Some(s) if s.ver() == kd.version() => Some(unsafe { s.get_unchecked_mut() }),
+            Some(s) if s.ver(Ordering::Relaxed) == kd.version() => Some(unsafe { s.get_unchecked_mut() }),
             _ => None,
         }
     }
@@ -554,27 +554,27 @@ impl<K: Key, V> KeyMap<K, V> {
     /// ```
     pub fn set(&mut self, k: K, v: V) -> std::result::Result<Option<V>, V> {
         let kd = k.data();
-        let e = self.arr.get_alloc(kd.index() as usize);
+        let e = self.arr.load_alloc(kd.index() as usize, 1);
         Self::update(kd, v, e)
     }
     fn update(kd: KeyData, v: V, s: &mut Slot<V>) -> std::result::Result<Option<V>, V> {
-        let ver = s.ver();
+        let ver = s.ver(Ordering::Relaxed);
         if is_older_version(kd.version(), ver) {
             return Err(v);
         }
         if check_null(ver) {
             s.value.value = ManuallyDrop::new(v);
-            s.set_ver(kd.version());
+            s.set_ver(kd.version(), Ordering::Release);
             Ok(None)
         } else {
             let dest = unsafe { DerefMut::deref_mut(&mut s.value.value) };
             let r = Ok(Some(replace(dest, v)));
-            s.set_ver(kd.version());
+            s.set_ver(kd.version(), Ordering::Release);
             r
         }
     }
     /// Returns a mutable reference to the value corresponding to the key.
-    ///
+    /// todo 应该加个Entry，drop时，set_ver(Ordering::Release)
     /// # Examples
     ///
     /// ```
@@ -589,7 +589,7 @@ impl<K: Key, V> KeyMap<K, V> {
     pub fn load(&self, k: K) -> Option<&mut V> {
         let kd = k.data();
         match self.arr.load(kd.index() as usize) {
-            Some(s) if s.ver() == kd.version() => Some(unsafe { s.get_unchecked_mut() }),
+            Some(s) if s.ver(Ordering::Acquire) == kd.version() => Some(unsafe { s.get_unchecked_mut() }),
             _ => None,
         }
     }
@@ -645,11 +645,11 @@ impl<K: Key, V> KeyMap<K, V> {
     }
     /// 整理方法
     pub unsafe fn collect_value(&self, tail: u32, free: KeyData) {
-        let e = self.arr.load_alloc(tail as usize);
-        e.set_ver(1);
+        let e = self.arr.load_alloc(tail as usize, 1);
+        e.set_ver(1, Ordering::Relaxed);
         let value = e.take();
-        let hole = self.arr.load_alloc(free.index() as usize);
-        hole.set_ver(free.version());
+        let hole = self.arr.load_alloc(free.index() as usize, 1);
+        hole.set_ver(free.version(), Ordering::Relaxed);
         std::ptr::write(&mut hole.value.value, ManuallyDrop::new(value));
     }
 }
@@ -667,11 +667,7 @@ impl<K: Key, V> IndexMut<K> for KeyMap<K, V> {
             .expect("no element found at index_mut {index}")
     }
 }
-impl<K: Key, V: Debug> Debug for KeyMap<K, V> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        f.debug_tuple("KeyMap").field(&self.arr).finish()
-    }
-}
+
 
 fn check_null(v: u32) -> bool {
     v & 1 == 1
@@ -707,11 +703,11 @@ impl<T> Slot<T> {
     unsafe fn take(&mut self) -> T {
         ManuallyDrop::take(&mut self.value.value)
     }
-    fn ver(&self) -> u32 {
-        self.version.load(Ordering::Acquire)
+    fn ver(&self, order: Ordering) -> u32 {
+        self.version.load(order)
     }
-    fn set_ver(&mut self, v: u32) {
-        self.version.store(v, Ordering::Release)
+    fn set_ver(&mut self, v: u32, order: Ordering) {
+        self.version.store(v, order)
     }
 }
 
@@ -724,7 +720,7 @@ impl<T> Null for Slot<T> {
     }
 
     fn is_null(&self) -> bool {
-        check_null(self.ver())
+        check_null(self.ver(Ordering::Relaxed))
     }
 }
 impl<T> Default for Slot<T> {
@@ -752,6 +748,21 @@ impl<T: Debug> Debug for Slot<T> {
     }
 }
 
+struct KeyMapFormatter<'a, K: Key, V> {
+    map: &'a KeyMap<K, V>,
+    len: usize,
+}
+impl<'a, K: Key, V: Debug>  KeyMapFormatter<'a, K, V> {
+    fn new(map: &'a KeyMap<K, V>, len: usize) -> Self{
+        Self{map, len}
+    }
+}
+
+impl<'a, K: Key, V: Debug> Debug for KeyMapFormatter<'a, K, V> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_list().entries(self.map.iter(0..self.len)).finish()
+    }
+}
 pub struct Iter<'a, K: Key, V> {
     iter: pi_arr::Iter<'a, Slot<V>>,
     _k: PhantomData<fn(K) -> K>,
@@ -760,11 +771,13 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
     type Item = (K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((index, e)) = self.iter.next() {
-            let ver = e.ver();
+        while let Some(e) = self.iter.next() {
+            let ver = e.ver(Ordering::Relaxed);
             if check_null(ver) {
                 continue;
             }
+            let start = self.iter.start();
+            let index = pi_arr::Location::index(start.bucket as u32, start.entry) - 1;
             let ffi = (u64::from(ver) << 32) | u64::from(index as u32);
             return Some((KeyData::from_ffi(ffi).into(), unsafe { &mut e.value.value }));
         }
