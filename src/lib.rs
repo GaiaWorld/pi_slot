@@ -5,7 +5,7 @@ use std::mem::replace;
 use std::ops::{DerefMut, Index, IndexMut, Range};
 use std::sync::atomic::Ordering;
 
-use pi_arr::*;
+use pi_append_vec::AppendVec;
 use pi_key_alloter::*;
 use pi_null::Null;
 use pi_share::ShareU32;
@@ -28,6 +28,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// new_key_type! {
     ///     struct MessageKey;
     /// }
@@ -36,11 +37,16 @@ impl<K: Key, V> SlotMap<K, V> {
     /// let good_day = messages.insert("Good day");
     /// let hello = messages.insert("Hello");
     /// ```
+    #[inline(always)]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             alloter: KeyAlloter::new(0),
             map: KeyMap::with_capacity(capacity),
         }
+    }
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::with_capacity(0)
     }
 
     /// Returns the number of elements in the slot map.
@@ -49,12 +55,14 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::with_capacity(10);
     /// sm.insert("len() counts actual elements, not capacity");
-    /// let key = sm.insert("removed elements don't count either");
+    /// let key: DefaultKey = sm.insert("removed elements don't count either");
     /// sm.remove(key);
     /// assert_eq!(sm.len(), 1);
     /// ```
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.alloter.len()
     }
@@ -64,12 +72,14 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::with_capacity(10);
     /// sm.insert("len() counts actual elements, not capacity");
-    /// let key = sm.insert("removed elements don't count either");
+    /// let key: DefaultKey = sm.insert("removed elements don't count either");
     /// sm.remove(key);
     /// assert_eq!(sm.max(), 2);
     /// ```
+    #[inline(always)]
     pub fn max(&self) -> u32 {
         self.alloter.max()
     }
@@ -79,19 +89,23 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let key = sm.insert("dummy");
+    /// let key: DefaultKey = sm.insert("dummy");
     /// assert_eq!(sm.is_empty(), false);
     /// sm.remove(key);
     /// assert_eq!(sm.is_empty(), true);
     /// ```
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     /// 分配一个Key, 后面要求一定要用set_value设置Value，否则remove时回收Key会失败，另外，再没有插入数据期间，如果进行迭代，也是没有该key的
+    #[inline(always)]
     pub unsafe fn alloc_key(&self) -> K {
         self.alloter.alloc(2, 2).into()
     }
+    #[inline(always)]
     pub unsafe fn set_value(&self, k: K, v: V) -> std::result::Result<Option<V>, V> {
         self.map.insert(k, v)
     }
@@ -101,12 +115,14 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let key = sm.insert(42);
+    /// let key: DefaultKey = sm.insert(42);
     /// assert_eq!(sm.contains_key(key), true);
     /// sm.remove(key);
     /// assert_eq!(sm.contains_key(key), false);
     /// ```
+    #[inline(always)]
     pub fn contains_key(&self, k: K) -> bool {
         self.map.contains_key(k)
     }
@@ -122,8 +138,9 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let key = sm.insert(42);
+    /// let key: DefaultKey = sm.insert(42);
     /// assert_eq!(sm[key], 42);
     /// ```
     #[inline(always)]
@@ -139,11 +156,13 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let key = sm.insert(42);
+    /// let key: DefaultKey = sm.insert(42);
     /// assert_eq!(sm.remove(key), Some(42));
     /// assert_eq!(sm.remove(key), None);
     /// ```
+    #[inline(always)]
     pub fn remove(&self, k: K) -> Option<V> {
         let r = self.map.remove(k);
         if r.is_some() {
@@ -157,12 +176,14 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let key = sm.insert("bar");
+    /// let key: DefaultKey = sm.insert("bar");
     /// assert_eq!(sm.get(key), Some(&"bar"));
     /// sm.remove(key);
     /// assert_eq!(sm.get(key), None);
     /// ```
+    #[inline(always)]
     pub fn get(&self, k: K) -> Option<&V> {
         self.map.get(k)
     }
@@ -179,12 +200,14 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert("bar");
+    /// use pi_key_alloter::*;
+    /// let mut sm = SlotMap::new();
+    /// let key: DefaultKey = sm.insert("bar");
     /// assert_eq!(unsafe { sm.get_unchecked(key) }, &"bar");
     /// sm.remove(key);
     /// // sm.get_unchecked(key) is now dangerous!
     /// ```
+    #[inline(always)]
     pub unsafe fn get_unchecked(&self, k: K) -> &V {
         self.map.get_unchecked(k)
     }
@@ -195,13 +218,15 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert(3.5);
+    /// use pi_key_alloter::*;
+    /// let mut sm = SlotMap::new();
+    /// let key: DefaultKey = sm.insert(3.5);
     /// if let Some(x) = sm.get_mut(key) {
     ///     *x += 3.0;
     /// }
     /// assert_eq!(sm[key], 6.5);
     /// ```
+    #[inline(always)]
     pub fn get_mut(&mut self, k: K) -> Option<&mut V> {
         self.map.get_mut(k)
     }
@@ -218,13 +243,15 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert("foo");
+    /// use pi_key_alloter::*;
+    /// let mut sm = SlotMap::new();
+    /// let key: DefaultKey = sm.insert("foo");
     /// unsafe { *sm.get_unchecked_mut(key) = "bar" };
     /// assert_eq!(sm[key], "bar");
     /// sm.remove(key);
     /// // sm.get_unchecked_mut(key) is now dangerous!
     /// ```
+    #[inline(always)]
     pub unsafe fn get_unchecked_mut(&mut self, k: K) -> &mut V {
         self.map.get_unchecked_mut(k)
     }
@@ -240,10 +267,12 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let mut sm = SlotMap::new();
-    /// let key = sm.set(42);
+    /// let key: DefaultKey = sm.set(42);
     /// assert_eq!(sm[key], 42);
     /// ```
+    #[inline(always)]
     pub fn set(&mut self, v: V) -> K {
         let k = unsafe { self.alloc_key() };
         assert!(self.map.set(k, v).is_ok());
@@ -255,13 +284,15 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let key = sm.insert(3.5);
+    /// let key: DefaultKey = sm.insert(3.5);
     /// if let Some(x) = sm.load(key) {
     ///     *x += 3.0;
     /// }
     /// assert_eq!(sm[key], 6.5);
     /// ```
+    #[inline(always)]
     pub fn load(&self, k: K) -> Option<&mut V> {
         self.map.load(k)
     }
@@ -278,13 +309,14 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let key = sm.insert("foo");
-    /// unsafe { *sm.get_unchecked_mut(key) = "bar" };
+    /// let key: DefaultKey = sm.insert("foo");
+    /// unsafe { *sm.load_unchecked(key) = "bar" };
     /// assert_eq!(sm[key], "bar");
     /// sm.remove(key);
-    /// // sm.get_unchecked_mut(key) is now dangerous!
     /// ```
+    #[inline(always)]
     pub unsafe fn load_unchecked(&self, k: K) -> &mut V {
         self.map.load_unchecked(k)
     }
@@ -298,15 +330,17 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// let sm = SlotMap::new();
-    /// let k0 = sm.insert(0);
-    /// let k1 = sm.insert(1);
-    /// let k2 = sm.insert(2);
+    /// let k0: DefaultKey = sm.insert(0);
+    /// let k1: DefaultKey = sm.insert(1);
+    /// let k2: DefaultKey = sm.insert(2);
     ///
     /// for (k, v) in sm.iter() {
     ///     println!("key: {:?}, val: {}", k, v);
     /// }
     /// ```
+    #[inline(always)]
     pub fn iter(&self) -> Iter<'_, K, V> {
         self.map.iter(0..self.alloter.max() as usize)
     }
@@ -321,14 +355,24 @@ impl<K: Key, V> SlotMap<K, V> {
     /// let mut iterator = arr.slice(1..3);
     ///
     /// let r = iterator.next().unwrap();
-    /// assert_eq!((r.0, *r.1), (1, 2));
+    /// assert_eq!(*r, 2);
     /// let r = iterator.next().unwrap();
-    /// assert_eq!((r.0, *r.1), (2, 4));
+    /// assert_eq!(*r, 4);
     /// assert_eq!(iterator.next(), None);
     /// ```
-    pub fn slice(&self, range: Range<usize>) -> Iter<'_, K, V> {
+    pub fn slice(&self, mut range: Range<usize>) -> Iter<'_, K, V> {
+        let len = self.max() as usize;
+        if range.end > len {
+            range.end = len;
+        }
         self.map.iter(range)
     }
+    /// 扩容
+    #[inline(always)]
+    pub fn reserve(&mut self, additional: usize) {
+        self.map.reserve(self.len() + additional);
+    }
+    
     /// 整理方法
     pub fn collect_key(&self) -> Drain {
         self.alloter.collect(2)
@@ -341,11 +385,13 @@ impl<K: Key, V> SlotMap<K, V> {
 impl<K: Key, V> Index<K> for SlotMap<K, V> {
     type Output = V;
 
+    #[inline(always)]
     fn index(&self, index: K) -> &Self::Output {
         self.map.index(index)
     }
 }
 impl<K: Key, V> IndexMut<K> for SlotMap<K, V> {
+    #[inline(always)]
     fn index_mut(&mut self, index: K) -> &mut Self::Output {
         self.map.index_mut(index)
     }
@@ -361,8 +407,8 @@ impl<K: Key, V: Debug> Debug for SlotMap<K, V> {
 
 #[derive(Default)]
 pub struct KeyMap<K: Key, V> {
-    arr: Arr<Slot<V>>,
-    _k: PhantomData<fn(K) -> K>,
+    arr: AppendVec<Slot<V>>,
+    _k: PhantomData<K>,
 }
 impl<K: Key, V> KeyMap<K, V> {
     /// Creates an empty [`KeyMap`] with the given capacity and a custom key
@@ -375,23 +421,28 @@ impl<K: Key, V> KeyMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
     /// new_key_type! {
     ///     struct MessageKey;
     /// }
-    /// let mut messages = KeyMap::with_capacity(3);
+    /// let mut messages = SlotMap::with_capacity(3);
+    /// let mut km = KeyMap::with_capacity(3);
     /// let welcome: MessageKey = messages.insert("Welcome");
+    /// km.insert(welcome, "Welcome1");
     /// let good_day = messages.insert("Good day");
+    /// km.insert(good_day, "Good day1");
     /// let hello = messages.insert("Hello");
+    /// km.insert(hello, "Hello1");
     /// ```
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            arr: Arr::with_capacity(capacity),
+            arr: AppendVec::with_capacity(capacity),
             _k: PhantomData,
         }
     }
     pub fn contains_key(&self, k: K) -> bool {
         let kd = k.data();
-        match self.arr.get(kd.index() as usize) {
+        match self.arr.get_i(kd.index() as usize) {
             Some(s) => s.ver(Ordering::Relaxed) == kd.version(),
             None => false,
         }
@@ -433,7 +484,7 @@ impl<K: Key, V> KeyMap<K, V> {
     /// ```
     pub fn remove(&self, k: K) -> Option<V> {
         let kd = k.data();
-        match self.arr.load(kd.index() as usize) {
+        match self.arr.load_i(kd.index() as usize) {
             Some(e) => {
                 let v = e.ver(Ordering::Relaxed);
                 if v == kd.version() {
@@ -459,9 +510,10 @@ impl<K: Key, V> KeyMap<K, V> {
     /// sm.remove(key);
     /// assert_eq!(sm.get(key), None);
     /// ```
+    #[inline(always)]
     pub fn get(&self, k: K) -> Option<&V> {
         let kd = k.data();
-        match self.arr.get(kd.index() as usize) {
+        match self.arr.get_i(kd.index() as usize) {
             Some(s) if s.ver(Ordering::Acquire) == kd.version() => Some(unsafe { s.get_unchecked() }),
             _ => None,
         }
@@ -485,6 +537,7 @@ impl<K: Key, V> KeyMap<K, V> {
     /// sm.remove(key);
     /// // sm.get_unchecked(key) is now dangerous!
     /// ```
+    #[inline(always)]
     pub unsafe fn get_unchecked(&self, k: K) -> &V {
         self.arr
             .get_unchecked(k.data().index() as usize)
@@ -504,9 +557,10 @@ impl<K: Key, V> KeyMap<K, V> {
     /// }
     /// assert_eq!(sm[key], 6.5);
     /// ```
+    #[inline(always)]
     pub fn get_mut(&mut self, k: K) -> Option<&mut V> {
         let kd = k.data();
-        match self.arr.get_mut(kd.index() as usize) {
+        match self.arr.get_mut_i(kd.index() as usize) {
             Some(s) if s.ver(Ordering::Relaxed) == kd.version() => Some(unsafe { s.get_unchecked_mut() }),
             _ => None,
         }
@@ -531,6 +585,7 @@ impl<K: Key, V> KeyMap<K, V> {
     /// sm.remove(key);
     /// // sm.get_unchecked_mut(key) is now dangerous!
     /// ```
+    #[inline(always)]
     pub unsafe fn get_unchecked_mut(&mut self, k: K) -> &mut V {
         self.arr
             .get_unchecked_mut(k.data().index() as usize)
@@ -552,6 +607,7 @@ impl<K: Key, V> KeyMap<K, V> {
     /// let key = sm.set(42);
     /// assert_eq!(sm[key], 42);
     /// ```
+    #[inline(always)]
     pub fn set(&mut self, k: K, v: V) -> std::result::Result<Option<V>, V> {
         let kd = k.data();
         let e = self.arr.load_alloc(kd.index() as usize, 1);
@@ -586,9 +642,10 @@ impl<K: Key, V> KeyMap<K, V> {
     /// }
     /// assert_eq!(sm[key], 6.5);
     /// ```
+    #[inline(always)]
     pub fn load(&self, k: K) -> Option<&mut V> {
         let kd = k.data();
-        match self.arr.load(kd.index() as usize) {
+        match self.arr.load_i(kd.index() as usize) {
             Some(s) if s.ver(Ordering::Acquire) == kd.version() => Some(unsafe { s.get_unchecked_mut() }),
             _ => None,
         }
@@ -613,6 +670,7 @@ impl<K: Key, V> KeyMap<K, V> {
     /// sm.remove(key);
     /// // sm.index_unchecked_mut(key) is now dangerous!
     /// ```
+    #[inline(always)]
     pub unsafe fn load_unchecked(&self, k: K) -> &mut V {
         self.arr
             .load_unchecked(k.data().index() as usize)
@@ -637,11 +695,22 @@ impl<K: Key, V> KeyMap<K, V> {
     ///     println!("key: {:?}, val: {}", k, v);
     /// }
     /// ```
+    #[inline(always)]
     pub fn iter(&self, range: Range<usize>) -> Iter<'_, K, V> {
         Iter {
-            iter: self.arr.slice(range),
+            iter: self.arr.slice_raw(range),
+            vec_capacity: self.arr.vec_capacity(),
             _k: PhantomData,
         }
+    }
+    /// 扩容到指定容量
+    pub fn reserve(&mut self, capacity: usize) {
+        let additional = if capacity <= self.arr.vec_capacity() {
+            return
+        }else{
+            capacity - self.arr.vec_capacity()
+        };
+        self.arr.collect_raw(self.arr.vec_capacity(), additional, 1);
     }
     /// 整理方法
     pub unsafe fn collect_value(&self, tail: u32, free: KeyData) {
@@ -657,11 +726,13 @@ impl<K: Key, V> KeyMap<K, V> {
 impl<K: Key, V> Index<K> for KeyMap<K, V> {
     type Output = V;
 
+    #[inline(always)]
     fn index(&self, index: K) -> &Self::Output {
         self.get(index).expect("no element found at index {index}")
     }
 }
 impl<K: Key, V> IndexMut<K> for KeyMap<K, V> {
+    #[inline(always)]
     fn index_mut(&mut self, index: K) -> &mut Self::Output {
         self.get_mut(index)
             .expect("no element found at index_mut {index}")
@@ -669,6 +740,7 @@ impl<K: Key, V> IndexMut<K> for KeyMap<K, V> {
 }
 
 
+#[inline(always)]
 fn check_null(v: u32) -> bool {
     v & 1 == 1
 }
@@ -712,13 +784,14 @@ impl<T> Slot<T> {
 }
 
 impl<T> Null for Slot<T> {
+    #[inline(always)]
     fn null() -> Self {
         Slot {
             value: SlotUnion { none: () },
             version: ShareU32::new(1),
         }
     }
-
+    #[inline(always)]
     fn is_null(&self) -> bool {
         check_null(self.ver(Ordering::Relaxed))
     }
@@ -765,6 +838,7 @@ impl<'a, K: Key, V: Debug> Debug for KeyMapFormatter<'a, K, V> {
 }
 pub struct Iter<'a, K: Key, V> {
     iter: pi_arr::Iter<'a, Slot<V>>,
+    vec_capacity: usize,
     _k: PhantomData<fn(K) -> K>,
 }
 impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
@@ -777,7 +851,11 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
                 continue;
             }
             let start = self.iter.start();
-            let index = pi_arr::Location::index(start.bucket as u32, start.entry) - 1;
+            let index = if start.bucket < 0 {
+                start.entry - 1
+            }else{
+                self.vec_capacity + pi_arr::Location::index(start.bucket as u32, start.entry) - 1
+            };
             let ffi = (u64::from(ver) << 32) | u64::from(index as u32);
             return Some((KeyData::from_ffi(ffi).into(), unsafe { &mut e.value.value }));
         }
