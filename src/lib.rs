@@ -372,7 +372,11 @@ impl<K: Key, V> SlotMap<K, V> {
     pub fn reserve(&mut self, additional: usize) {
         self.map.reserve(self.len() + additional);
     }
-    
+    /// 将arr的内容移动到vec上，让内存连续，并且没有原子操作
+    #[inline(always)]
+    pub fn collect(&mut self) {
+        self.map.collect()
+    }
     /// 整理方法
     pub fn collect_key(&self) -> Drain {
         self.alloter.collect(2)
@@ -712,6 +716,12 @@ impl<K: Key, V> KeyMap<K, V> {
         };
         self.arr.collect_raw(self.arr.vec_capacity(), additional, 1);
     }
+    /// 将arr的内容移动到vec上，让内存连续，并且没有原子操作
+    #[inline(always)]
+    pub fn collect(&mut self) {
+        self.arr.collect(1);
+    }
+    
     /// 整理方法
     pub unsafe fn collect_value(&self, tail: u32, free: KeyData) {
         let e = self.arr.load_alloc(tail as usize, 1);
