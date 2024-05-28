@@ -374,16 +374,16 @@ impl<K: Key, V> SlotMap<K, V> {
     }
     /// 将arr的内容移动到vec上，让内存连续，并且没有原子操作
     #[inline(always)]
-    pub fn collect(&mut self) {
-        self.map.collect()
+    pub fn settle(&mut self) {
+        self.map.settle()
     }
     /// 整理方法
-    pub fn collect_key(&self) -> Drain {
-        self.alloter.collect(2)
+    pub fn settle_key(&self) -> Drain {
+        self.alloter.settle(2)
     }
     /// 整理方法
-    pub unsafe fn collect_value(&self, tail: u32, free: KeyData) {
-        self.map.collect_value(tail, free)
+    pub unsafe fn settle_value(&self, tail: u32, free: KeyData) {
+        self.map.settle_value(tail, free)
     }
 }
 impl<K: Key, V> Index<K> for SlotMap<K, V> {
@@ -723,16 +723,16 @@ impl<K: Key, V> KeyMap<K, V> {
         } else {
             capacity - self.arr.vec_capacity()
         };
-        self.arr.collect_raw(self.arr.vec_capacity(), additional);
+        self.arr.settle_raw(self.arr.vec_capacity(), additional);
     }
     /// 将arr的内容移动到vec上，让内存连续，并且没有原子操作
     #[inline(always)]
-    pub fn collect(&mut self) {
-        self.arr.collect();
+    pub fn settle(&mut self) {
+        self.arr.settle();
     }
 
     /// 整理方法
-    pub unsafe fn collect_value(&self, tail: u32, free: KeyData) {
+    pub unsafe fn settle_value(&self, tail: u32, free: KeyData) {
         let e = self.arr.load_alloc(tail as usize);
         e.set_ver(1, Ordering::Relaxed);
         let value = e.take();
@@ -917,9 +917,9 @@ mod tests {
             println!("key: {:?}, val: {}", k, v);
         }
         assert_eq!(sm.max(), 3);
-        for (k, v) in sm.collect_key() {
+        for (k, v) in sm.settle_key() {
             unsafe {
-                sm.collect_value(k, v);
+                sm.settle_value(k, v);
             }
         }
         assert_eq!(sm[hello1], "Hello1");

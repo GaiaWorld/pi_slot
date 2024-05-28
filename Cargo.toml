@@ -1,6 +1,6 @@
 [package]
 name = "pi_slot"
-version = "0.1.8"
+version = "0.2.0"
 authors = ["suncy <530739162@qq.com>"]
 edition = "2021"
 description = "lock free Slotmap data structure"
@@ -14,6 +14,6 @@ categories = ["data-structures", "memory-management", "caching"]
 [dependencies]
 pi_null = "0.1"
 pi_arr = "0.18"
-pi_append_vec = "0.3"
+pi_append_vec = "0.4"
 pi_share = "0.4"
-pi_key_alloter = "0.4"
+pi_key_alloter = "0.5"
