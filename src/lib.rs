@@ -5,14 +5,14 @@ use std::mem::replace;
 use std::ops::{DerefMut, Index, IndexMut, Range};
 use std::sync::atomic::Ordering;
 
-use pi_append_vec::AppendVec;
+use pi_arr::Arr;
 use pi_key_alloter::*;
 use pi_null::Null;
 use pi_share::ShareU32;
 
 /// Thread-safe slotmap
 #[derive(Default)]
-pub struct SlotMap<K: Key, V> {
+pub struct SlotMap<K: Key = DefaultKey, V = ()> {
     alloter: KeyAlloter,
     map: KeyMap<K, V>,
 }
@@ -367,15 +367,10 @@ impl<K: Key, V> SlotMap<K, V> {
         }
         self.map.iter(range)
     }
-    /// 扩容
-    #[inline(always)]
-    pub fn reserve(&mut self, additional: usize) {
-        self.map.reserve(self.len() + additional);
-    }
     /// 将arr的内容移动到vec上，让内存连续，并且没有原子操作
     #[inline(always)]
-    pub fn settle(&mut self) {
-        self.map.settle()
+    pub fn settle(&mut self, additional: usize) {
+        self.map.settle(self.alloter.max() as usize, additional);
     }
     /// 整理方法
     pub fn settle_key(&self) -> Drain {
@@ -414,7 +409,7 @@ impl<K: Key, V: Debug> Debug for SlotMap<K, V> {
 
 #[derive(Default)]
 pub struct KeyMap<K: Key, V> {
-    arr: AppendVec<Slot<V>>,
+    arr: Arr<Slot<V>>,
     _k: PhantomData<K>,
 }
 impl<K: Key, V> KeyMap<K, V> {
@@ -443,13 +438,27 @@ impl<K: Key, V> KeyMap<K, V> {
     /// ```
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            arr: AppendVec::with_capacity(capacity),
+            arr: Arr::with_capacity(capacity),
             _k: PhantomData,
         }
     }
+    /// # Examples
+    ///
+    /// ```
+    /// # use pi_slot::*;
+    /// use pi_key_alloter::*;
+    /// new_key_type! {
+    ///     struct MessageKey;
+    /// }
+    /// let mut messages = SlotMap::with_capacity(3);
+    /// let mut km = KeyMap::with_capacity(3);
+    /// let welcome: MessageKey = messages.insert("Welcome");
+    /// km.insert(welcome, "Welcome1");
+    /// assert!(km.contains_key(welcome));
+    /// ```
     pub fn contains_key(&self, k: K) -> bool {
         let kd = k.data();
-        match self.arr.get_i(kd.index() as usize) {
+        match self.arr.get(kd.index() as usize) {
             Some(s) => s.ver(Ordering::Relaxed) == kd.version(),
             None => false,
         }
@@ -466,9 +475,18 @@ impl<K: Key, V> KeyMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert(42);
-    /// assert_eq!(sm[key], 42);
+    /// use pi_key_alloter::*;
+    /// new_key_type! {
+    ///     struct MessageKey;
+    /// }
+    /// let mut messages = SlotMap::with_capacity(3);
+    /// let mut km = KeyMap::with_capacity(3);
+    /// let welcome: MessageKey = messages.insert("Welcome");
+    /// km.insert(welcome, "Welcome1");
+    /// let good_day = messages.insert("Good day");
+    /// km.insert(good_day, "Good day1");
+    /// let hello = messages.insert("Hello");
+    /// km.insert(hello, "Hello1");
     /// ```
     #[inline(always)]
     pub fn insert(&self, k: K, v: V) -> std::result::Result<Option<V>, V> {
@@ -484,14 +502,21 @@ impl<K: Key, V> KeyMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert(42);
-    /// assert_eq!(sm.remove(key), Some(42));
-    /// assert_eq!(sm.remove(key), None);
+    /// use pi_key_alloter::*;
+    /// new_key_type! {
+    ///     struct MessageKey;
+    /// }
+    /// let mut messages = SlotMap::with_capacity(3);
+    /// let mut km = KeyMap::with_capacity(3);
+    /// let welcome: MessageKey = messages.insert("Welcome");
+    /// km.insert(welcome, "Welcome1");
+    /// let good_day = messages.insert("Good day");
+    /// km.insert(good_day, "Good day1");
+    /// assert_eq!(km.remove(welcome), Some("Welcome1"));
     /// ```
     pub fn remove(&self, k: K) -> Option<V> {
         let kd = k.data();
-        match self.arr.load_i(kd.index() as usize) {
+        match self.arr.load(kd.index() as usize) {
             Some(e) => {
                 let v = e.ver(Ordering::Relaxed);
                 if v == kd.version() {
@@ -511,16 +536,22 @@ impl<K: Key, V> KeyMap<K, V> {
     ///
     /// ```
     /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert("bar");
-    /// assert_eq!(sm.get(key), Some(&"bar"));
-    /// sm.remove(key);
-    /// assert_eq!(sm.get(key), None);
+    /// use pi_key_alloter::*;
+    /// new_key_type! {
+    ///     struct MessageKey;
+    /// }
+    /// let mut messages = SlotMap::with_capacity(3);
+    /// let mut km = KeyMap::with_capacity(3);
+    /// let welcome: MessageKey = messages.insert("Welcome");
+    /// km.insert(welcome, "Welcome1");
+    /// let good_day = messages.insert("Good day");
+    /// km.insert(good_day, "Good day1");
+    /// assert_eq!(km.get(welcome), Some("Welcome1").as_ref());
     /// ```
     #[inline(always)]
     pub fn get(&self, k: K) -> Option<&V> {
         let kd = k.data();
-        match self.arr.get_i(kd.index() as usize) {
+        match self.arr.get(kd.index() as usize) {
             Some(s) if s.ver(Ordering::Acquire) == kd.version() => {
                 Some(unsafe { s.get_unchecked() })
             }
@@ -539,12 +570,6 @@ impl<K: Key, V> KeyMap<K, V> {
     /// # Examples
     ///
     /// ```
-    /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert("bar");
-    /// assert_eq!(unsafe { sm.get_unchecked(key) }, &"bar");
-    /// sm.remove(key);
-    /// // sm.get_unchecked(key) is now dangerous!
     /// ```
     #[inline(always)]
     pub unsafe fn get_unchecked(&self, k: K) -> &V {
@@ -558,18 +583,11 @@ impl<K: Key, V> KeyMap<K, V> {
     /// # Examples
     ///
     /// ```
-    /// # use pi_slot::*;
-    /// let mut sm = SlotMap::new();
-    /// let key = sm.insert(3.5);
-    /// if let Some(x) = sm.get_mut(key) {
-    ///     *x += 3.0;
-    /// }
-    /// assert_eq!(sm[key], 6.5);
     /// ```
     #[inline(always)]
     pub fn get_mut(&mut self, k: K) -> Option<&mut V> {
         let kd = k.data();
-        match self.arr.get_mut_i(kd.index() as usize) {
+        match self.arr.get_mut(kd.index() as usize) {
             Some(s) if s.ver(Ordering::Relaxed) == kd.version() => {
                 Some(unsafe { s.get_unchecked_mut() })
             }
@@ -588,13 +606,6 @@ impl<K: Key, V> KeyMap<K, V> {
     /// # Examples
     ///
     /// ```
-    /// # use pi_slot::*;
-    /// let mut sm = SlotMap::new();
-    /// let key = sm.insert("foo");
-    /// unsafe { *sm.get_unchecked_mut(key) = "bar" };
-    /// assert_eq!(sm[key], "bar");
-    /// sm.remove(key);
-    /// // sm.get_unchecked_mut(key) is now dangerous!
     /// ```
     #[inline(always)]
     pub unsafe fn get_unchecked_mut(&mut self, k: K) -> &mut V {
@@ -613,10 +624,6 @@ impl<K: Key, V> KeyMap<K, V> {
     /// # Examples
     ///
     /// ```
-    /// # use pi_slot::*;
-    /// let mut sm = SlotMap::new();
-    /// let key = sm.set(42);
-    /// assert_eq!(sm[key], 42);
     /// ```
     #[inline(always)]
     pub fn set(&mut self, k: K, v: V) -> std::result::Result<Option<V>, V> {
@@ -645,18 +652,11 @@ impl<K: Key, V> KeyMap<K, V> {
     /// # Examples
     ///
     /// ```
-    /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert(3.5);
-    /// if let Some(x) = sm.load(key) {
-    ///     *x += 3.0;
-    /// }
-    /// assert_eq!(sm[key], 6.5);
     /// ```
     #[inline(always)]
     pub fn load(&self, k: K) -> Option<&mut V> {
         let kd = k.data();
-        match self.arr.load_i(kd.index() as usize) {
+        match self.arr.load(kd.index() as usize) {
             Some(s) if s.ver(Ordering::Acquire) == kd.version() => {
                 Some(unsafe { s.get_unchecked_mut() })
             }
@@ -675,13 +675,6 @@ impl<K: Key, V> KeyMap<K, V> {
     /// # Examples
     ///
     /// ```
-    /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let key = sm.insert("foo");
-    /// unsafe { *sm.index_unchecked_mut(key) = "bar" };
-    /// assert_eq!(sm[key], "bar");
-    /// sm.remove(key);
-    /// // sm.index_unchecked_mut(key) is now dangerous!
     /// ```
     #[inline(always)]
     pub unsafe fn load_unchecked(&self, k: K) -> &mut V {
@@ -698,37 +691,18 @@ impl<K: Key, V> KeyMap<K, V> {
     /// # Examples
     ///
     /// ```
-    /// # use pi_slot::*;
-    /// let sm = SlotMap::new();
-    /// let k0 = sm.insert(0);
-    /// let k1 = sm.insert(1);
-    /// let k2 = sm.insert(2);
-    ///
-    /// for (k, v) in sm.iter() {
-    ///     println!("key: {:?}, val: {}", k, v);
-    /// }
     /// ```
     #[inline(always)]
     pub fn iter(&self, range: Range<usize>) -> Iter<'_, K, V> {
         Iter {
-            iter: self.arr.slice_raw(range),
-            vec_capacity: self.arr.vec_capacity(),
+            iter: self.arr.slice(range),
             _k: PhantomData,
         }
     }
-    /// 扩容到指定容量
-    pub fn reserve(&mut self, capacity: usize) {
-        let additional = if capacity <= self.arr.vec_capacity() {
-            return;
-        } else {
-            capacity - self.arr.vec_capacity()
-        };
-        self.arr.settle_raw(self.arr.vec_capacity(), additional);
-    }
     /// 将arr的内容移动到vec上，让内存连续，并且没有原子操作
     #[inline(always)]
-    pub fn settle(&mut self) {
-        self.arr.settle();
+    pub fn settle(&mut self, len: usize, additional: usize) {
+        self.arr.settle(len, additional, 1);
     }
 
     /// 整理方法
@@ -856,7 +830,6 @@ impl<'a, K: Key, V: Debug> Debug for KeyMapFormatter<'a, K, V> {
 }
 pub struct Iter<'a, K: Key, V> {
     iter: pi_arr::Iter<'a, Slot<V>>,
-    vec_capacity: usize,
     _k: PhantomData<fn(K) -> K>,
 }
 impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
@@ -868,12 +841,7 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
             if check_null(ver) {
                 continue;
             }
-            let start = self.iter.start();
-            let index = if start.bucket < 0 {
-                start.entry - 1
-            } else {
-                self.vec_capacity + pi_arr::Location::index(start.bucket as u32, start.entry) - 1
-            };
+            let index = self.iter.index();
             let ffi = (u64::from(ver) << 32) | u64::from(index as u32);
             return Some((KeyData::from_ffi(ffi).into(), unsafe { &mut e.value.value }));
         }

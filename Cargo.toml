@@ -13,7 +13,6 @@ categories = ["data-structures", "memory-management", "caching"]
 
 [dependencies]
 pi_null = "0.1"
-pi_arr = "0.18"
-pi_append_vec = "0.4"
+pi_arr = "0.19"
 pi_share = "0.4"
 pi_key_alloter = "0.5"
