@@ -841,7 +841,7 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
             if check_null(ver) {
                 continue;
             }
-            let index = self.iter.index();
+            let index = self.iter.index() - 1;
             let ffi = (u64::from(ver) << 32) | u64::from(index as u32);
             return Some((KeyData::from_ffi(ffi).into(), unsafe { &mut e.value.value }));
         }
