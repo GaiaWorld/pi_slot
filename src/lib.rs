@@ -7,7 +7,6 @@ use std::sync::atomic::Ordering;
 
 use pi_arr::Arr;
 use pi_key_alloter::*;
-use pi_null::Null;
 use pi_share::ShareU32;
 
 /// Thread-safe slotmap
@@ -773,9 +772,6 @@ impl<T> Slot<T> {
     fn set_ver(&mut self, v: u32, order: Ordering) {
         self.version.store(v, order)
     }
-}
-
-impl<T> Null for Slot<T> {
     #[inline(always)]
     fn null() -> Self {
         Slot {
