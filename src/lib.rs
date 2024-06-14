@@ -1,6 +1,6 @@
 use core::fmt::*;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem::{size_of, ManuallyDrop};
 use std::mem::replace;
 use std::ops::{DerefMut, Index, IndexMut, Range};
 use std::sync::atomic::Ordering;
@@ -82,6 +82,11 @@ impl<K: Key, V> SlotMap<K, V> {
     pub fn max(&self) -> u32 {
         self.alloter.max()
     }
+    pub fn mem_size(&self) -> usize {
+        let c = self.map.arr.capacity(self.max() as usize);
+        c * (size_of::<V>() + size_of::<K>()) + size_of::<Self>()
+    }
+
     /// Returns if the slot map is empty.
     ///
     /// # Examples
