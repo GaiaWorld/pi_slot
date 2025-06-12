@@ -706,7 +706,7 @@ impl<K: Key, V> KeyMap<K, V> {
     /// 将arr的内容移动到vec上，让内存连续，并且没有原子操作
     #[inline(always)]
     pub fn settle(&mut self, len: usize, additional: usize) {
-        self.arr.settle(len, additional, 1);
+        self.arr.settle(len, additional);
     }
 
     /// 整理方法
