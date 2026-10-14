@@ -1,6 +1,5 @@
-use pi_slot::{DefaultKey, Key, KeyData, ShareU64, SlotMap};
+use pi_slot::{DefaultKey, Key, KeyData, ReserveError, ShareU64, SlotMap};
 use std::collections::HashSet;
-use std::mem::size_of;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -12,7 +11,159 @@ fn key(index: u32, version: u32) -> DefaultKey {
 }
 
 #[test]
-fn pi_key_preserves_even_live_and_full_generation_encoding() {
+fn rejected_reservation_does_not_construct_payload_or_consume_index() {
+    let map = SlotMap::<DefaultKey, DropValue>::new();
+    let constructed = AtomicUsize::new(0);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let result = map.try_reserve_if(|index| {
+        assert_eq!(index, 0);
+        false
+    });
+    match result {
+        Ok(writer) => {
+            constructed.fetch_add(1, Ordering::Relaxed);
+            writer.insert(DropValue(drops.clone()));
+            panic!("rejection must not return a writer");
+        }
+        Err(error) => assert_eq!(error, ReserveError::IndexRejected),
+    }
+    assert_eq!(constructed.load(Ordering::Relaxed), 0);
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_eq!((map.max(), map.len()), (0, 0));
+}
+
+#[cfg(feature = "rc")]
+#[test]
+fn rc_predicate_reentry_cannot_overwrite_initialized_slot() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let map = SlotMap::<DefaultKey, DropValue>::new();
+    let mut nested = None;
+    let result = map.try_reserve_if(|index| {
+        assert_eq!(index, 0);
+        nested = Some(map.insert(DropValue(drops.clone())));
+        true
+    });
+    assert!(matches!(result, Err(ReserveError::IndexRejected)));
+    drop(result);
+    assert_eq!((map.max(), map.len()), (1, 1));
+    assert!(map.get(nested.unwrap()).is_some());
+    drop(map);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn writer_rollback_and_free_reuse_bypass_limit_without_statistics() {
+    let mut map = SlotMap::<DefaultKey, String>::new();
+    let writer = map.try_reserve_if(|index| index < 1).unwrap();
+    assert_eq!((map.len(), map.max(), map.iter().count()), (0, 1, 0));
+    assert!(matches!(
+        map.try_reserve_if(|index| index < 1),
+        Err(ReserveError::IndexRejected)
+    ));
+    drop(writer);
+    assert_eq!((map.len(), map.max()), (0, 1));
+    let first = map
+        .try_reserve_if(|_| panic!("FREE must bypass predicate"))
+        .unwrap()
+        .insert_with_link("first".into(), u64::MAX);
+    assert_eq!((first.data().index(), first.data().version()), (0, 4));
+    assert_eq!(map.get(first).unwrap().1.load(Ordering::Relaxed), u64::MAX);
+    assert_eq!(map.remove(first), Some("first".into()));
+    let second = map
+        .try_reserve_if(|_| false)
+        .unwrap()
+        .insert("second".into());
+    assert_eq!(second.data().version(), 6);
+    assert_eq!(map.get(second).unwrap().1.load(Ordering::Relaxed), 0);
+    assert!(map.get(first).is_none());
+    assert_eq!(map.remove(second), Some("second".into()));
+    assert_eq!((map.len(), map.max()), (0, 1));
+}
+
+#[test]
+fn predicate_panic_and_payload_constructor_panic_restore_empty_slot() {
+    let map = SlotMap::<DefaultKey, String>::new();
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _ = map.try_reserve_if(|_| panic!("predicate"));
+    }))
+    .is_err());
+    assert_eq!((map.len(), map.max()), (0, 0));
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _writer = map.try_reserve_if(|index| index < 1).unwrap();
+        panic!("constructor before commit");
+    }))
+    .is_err());
+    assert_eq!((map.len(), map.max()), (0, 1));
+    let key = map
+        .try_reserve_if(|_| false)
+        .unwrap()
+        .insert("restored".into());
+    assert_eq!(key.data().version(), 4);
+    assert_eq!(map[key], "restored");
+}
+
+#[test]
+fn forgotten_writer_is_an_empty_uncounted_safe_leak() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let map = SlotMap::<DefaultKey, DropValue>::new();
+    std::mem::forget(map.try_reserve_if(|_| true).unwrap());
+    assert_eq!((map.len(), map.max(), map.iter().count()), (0, 1, 0));
+    map.try_reserve_if(|_| true)
+        .unwrap()
+        .insert(DropValue(drops.clone()));
+    assert_eq!(map.len(), 1);
+    drop(map);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(not(feature = "rc"))]
+#[test]
+fn fresh_index_cas_retry_rechecks_limits_one_and_two() {
+    use std::sync::Barrier;
+    for limit in [1, 2] {
+        let map = SlotMap::<DefaultKey, u32>::new();
+        let barrier = Barrier::new(4);
+        let calls = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|value| {
+                    let map = &map;
+                    let barrier = &barrier;
+                    let calls = &calls;
+                    scope.spawn(move || {
+                        let mut first = true;
+                        map.try_reserve_if(|index| {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            if first {
+                                first = false;
+                                assert_eq!(index, 0);
+                                barrier.wait();
+                            }
+                            index < limit
+                        })
+                        .map(|writer| writer.insert(value))
+                    })
+                })
+                .collect();
+            let mut committed = 0;
+            for handle in handles {
+                match handle.join().unwrap() {
+                    Ok(key) => {
+                        committed += 1;
+                        assert!(key.data().index() < limit);
+                    }
+                    Err(error) => assert_eq!(error, ReserveError::IndexRejected),
+                }
+            }
+            assert_eq!(committed, limit);
+        });
+        assert_eq!((map.max(), map.len()), (limit, limit as usize));
+        assert!(calls.load(Ordering::Relaxed) > 4);
+    }
+}
+
+#[test]
+fn pi_key_preserves_even_live_and_arbitrary_generation_encoding() {
     for version in [0, 1, 2, 3, 4, 1 << 21, u32::MAX - 1, u32::MAX] {
         let encoded = (u64::from(version) << 32) | 17;
         let data = KeyData::from_ffi(encoded);
@@ -32,15 +183,8 @@ fn default_build_has_atomic_thread_traits() {
 
 #[cfg(feature = "rc")]
 #[test]
-fn rc_build_has_no_thread_traits() {
-    // 若存在目标 trait，两种实现令推导歧义，从而编译失败。
-    trait NotSend<A> {
-        fn check() {}
-    }
-    impl<T: ?Sized> NotSend<()> for T {}
-    struct SendMarker;
-    impl<T: ?Sized + Send> NotSend<SendMarker> for T {}
-    let _ = <SlotMap<DefaultKey, String> as NotSend<_>>::check;
+fn rc_build_is_not_sync() {
+    // Actual RC fields must prevent Sync; Send is not forbidden.
     trait NotSync<A> {
         fn check() {}
     }
@@ -57,7 +201,7 @@ fn crud_stale_reuse_and_invalid_keys() {
     let b = map.set("b".into());
     assert_eq!((map.len(), map.max()), (2, 2));
     assert_eq!(a.data().version(), 2);
-    map[a].0.push('!');
+    map[a].push('!');
     map.get_mut(b).unwrap().0.push('?');
     assert_eq!(map.replace(a, "new".into()), Ok("a!".into()));
     assert_eq!(map.remove(a), Some("new".into()));
@@ -121,19 +265,19 @@ fn all_link_apis_preserve_or_return_snapshots() {
     let mut map = SlotMap::<DefaultKey, String>::new();
     let plain = map.insert("plain".into());
     let alias = map.set("alias".into());
-    assert_eq!(map[plain].1.load(Ordering::Relaxed), 0);
-    assert_eq!(map[alias].1.load(Ordering::Relaxed), 0);
+    assert_eq!(map.get(plain).unwrap().1.load(Ordering::Relaxed), 0);
+    assert_eq!(map.get(alias).unwrap().1.load(Ordering::Relaxed), 0);
     let a = map.insert_with_link("a".into(), u64::MAX);
     let b = map.set_with_link("b".into(), 23);
-    let address = &map[a].1 as *const ShareU64;
+    let address = map.get(a).unwrap().1 as *const ShareU64;
     map.get(a).unwrap().1.store(41, Ordering::Relaxed);
     assert_eq!(map.replace(a, "a2".into()), Ok("a".into()));
-    assert_eq!(map[a].1.load(Ordering::Relaxed), 41);
+    assert_eq!(map.get(a).unwrap().1.load(Ordering::Relaxed), 41);
     assert_eq!(
         map.replace_with_link(a, "a3".into(), 42),
         Ok(("a2".into(), 41))
     );
-    assert_eq!(address, &map[a].1 as *const ShareU64);
+    assert_eq!(address, map.get(a).unwrap().1 as *const ShareU64);
     assert_eq!(map.remove_with_link(a), Some(("a3".into(), 42)));
     assert_eq!(
         map.replace_with_link(a, "rejected".into(), 77),
@@ -167,19 +311,16 @@ fn all_link_apis_preserve_or_return_snapshots() {
 }
 
 #[test]
-fn exclusive_tuple_replacement_keeps_free_link_initialized() {
+fn exclusive_field_replacement_keeps_free_link_initialized() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut map = SlotMap::<DefaultKey, DropValue>::new();
     let a = map.insert(DropValue(drops.clone()));
     let b = map.insert(DropValue(drops.clone()));
-    let old = std::mem::replace(
-        map.get_mut(a).unwrap(),
-        (DropValue(drops.clone()), ShareU64::new(19)),
-    );
+    let old = std::mem::replace(map.get_mut(a).unwrap().0, DropValue(drops.clone()));
     drop(old);
-    map[b].1 = ShareU64::new(29);
+    *map.get_mut(b).unwrap().1 = ShareU64::new(29);
     for (_, tuple) in map.iter_mut() {
-        tuple.1 = ShareU64::new(39);
+        *tuple.1 = ShareU64::new(39);
     }
     assert_eq!(
         map.iter()
@@ -190,7 +331,7 @@ fn exclusive_tuple_replacement_keeps_free_link_initialized() {
     drop(map.remove_with_link(a).unwrap());
     drop(map.remove_with_link(b).unwrap());
     let reused = map.insert_with_link(DropValue(drops.clone()), 49);
-    assert_eq!(map[reused].1.load(Ordering::Relaxed), 49);
+    assert_eq!(map.get(reused).unwrap().1.load(Ordering::Relaxed), 49);
     drop(map);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
     #[cfg(feature = "rc")]
@@ -328,8 +469,8 @@ fn small_mpmc_transfers_unique_keys_before_shared_removal() {
     assert_eq!(map.len(), 0);
     assert_eq!(map.iter().count(), 0);
     let key = map.insert_with_link((9, 9), u64::MAX);
-    assert_eq!(map[key].0, (9, 9));
-    assert_eq!(map[key].1.load(Ordering::Relaxed), u64::MAX);
+    assert_eq!(map[key], (9, 9));
+    assert_eq!(map.get(key).unwrap().1.load(Ordering::Relaxed), u64::MAX);
 }
 
 #[test]
@@ -358,7 +499,23 @@ fn iter_mut_unique_references_and_frozen_upper_bound() {
     unsafe {
         map.get_unchecked_mut(keys[0]).0.push('?');
     }
-    assert_eq!(map[keys[0]].0, "0!?");
+    assert_eq!(map[keys[0]], "0!?");
+}
+
+#[test]
+fn iter_mut_preserves_keys_across_sparse_buckets() {
+    let mut map = SlotMap::<DefaultKey, usize>::new();
+    let keys: Vec<_> = (0..260).map(|value| map.insert(value)).collect();
+    for key in &keys[0..258] {
+        map.remove(*key);
+    }
+    let mut entries: Vec<_> = map.iter_mut().collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0, keys[258]);
+    assert_eq!(entries[1].0, keys[259]);
+    *entries[0].1 .0 = 42;
+    *entries[1].1 .0 = 43;
+    assert_eq!((map[keys[258]], map[keys[259]]), (42, 43));
 }
 
 struct DropValue(Arc<AtomicUsize>);
@@ -494,21 +651,8 @@ fn zst_small_value_and_high_alignment() {
     let mut aligned = SlotMap::<DefaultKey, Aligned>::new();
     let k = aligned.insert(Aligned(7));
     let reference = aligned.get(k).unwrap();
-    assert_eq!(&reference.0 as *const Aligned as usize % 128, 0);
+    assert_eq!(reference.0 as *const Aligned as usize % 128, 0);
     assert_eq!(aligned.remove(k).unwrap().0, 7);
-}
-
-#[test]
-fn memory_counts_allocated_segments_not_logical_len() {
-    let empty = SlotMap::<DefaultKey, u64>::new();
-    assert_eq!(empty.mem_size(), size_of::<SlotMap<DefaultKey, u64>>());
-    let preallocated = SlotMap::<DefaultKey, u64>::with_capacity(13);
-    let baseline = preallocated.mem_size();
-    assert!(baseline > empty.mem_size());
-    preallocated.insert(1);
-    assert_eq!(preallocated.mem_size(), baseline);
-    empty.insert(1);
-    assert!(empty.mem_size() > size_of::<SlotMap<DefaultKey, u64>>());
 }
 
 #[test]
@@ -516,13 +660,13 @@ fn public_custom_key_identity_and_index_panics() {
     pi_key::new_key_type! { struct MessageKey; }
     let mut map = SlotMap::<MessageKey, u32>::new();
     let k = map.insert(7);
-    assert_eq!(map[k].0, 7);
+    assert_eq!(map[k], 7);
     assert_eq!(map.remove(k), Some(7));
-    assert!(catch_unwind(AssertUnwindSafe(|| map[k].0)).is_err());
-    assert!(catch_unwind(AssertUnwindSafe(|| map[k].0 = 9)).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| map[k])).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| map[k] = 9)).is_err());
     let full = SlotMap::<u64, u32>::new();
     let k = full.insert(8);
-    assert_eq!(full[k].0, 8);
+    assert_eq!(full[k], 8);
 }
 
 #[cfg(not(feature = "rc"))]
@@ -544,7 +688,6 @@ fn parallel_insert_and_iteration_publish_complete_strings() {
                     assert!(value.0.bytes().all(|byte| byte == b'x'));
                     assert_eq!(value.1.load(Ordering::Relaxed), 987);
                 }
-                let _ = map.mem_size();
                 assert!(map.len() <= map.max() as usize);
             }
         });

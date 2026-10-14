@@ -1,11 +1,11 @@
-//! Stable-address slot map with permanent links and shared insertion.
-//! Shared reads return the value and its atomic link. Exclusive table access
-//! permits replacing the entire tuple; unsafe shared access only borrows T mutably.
+//! 版本化槽表。FREE link 保存完整标识，LIVE link 属于用户。
+//! 删除前必须终止所有目标槽引用；本库不提供 EBR 或两阶段退休。
+//! 默认 len/is_empty 扫描版本，复杂度 O(max)，并发时不是一致性快照。
 //! ```compile_fail
 //! use pi_slot::{DefaultKey, SlotMap};
 //! let map = SlotMap::<DefaultKey, u32>::new();
-//! map.insert(1);
-//! map.iter().next().unwrap().1.0 = 2;
+//! let key = map.insert(1);
+//! *map.get(key).unwrap().0 = 2;
 //! ```
 //! ```compile_fail
 //! use pi_slot::{DefaultKey, SlotMap};
@@ -20,113 +20,71 @@
 #[path = "../tests/support/private.rs"]
 mod private_tests;
 
+#[cfg(feature = "stats")]
+use crossbeam_utils::CachePadded;
+use pi_arr::Arr;
+pub use pi_key::{DefaultKey, Key, KeyData};
+use pi_share::ShareU32;
+pub use pi_share::ShareU64;
+#[cfg(feature = "stats")]
+use pi_share::ShareUsize;
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
-use std::mem::{size_of, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
 use std::ptr;
 use std::sync::atomic::Ordering;
 
-use pi_arr::SegmentedArr;
-pub use pi_key::{DefaultKey, Key, KeyData};
-use pi_share::ShareU32;
-pub use pi_share::ShareU64;
+const MAX_ENTRIES: usize = u32::MAX as usize - 32;
+const MAX_LIVE_VERSION: u32 = u32::MAX - 1;
+const NULL: u64 = u32::MAX as u64;
 
-const NULL_FULL: u64 = u64::MAX;
-const MAX_SLOTS: u32 = u32::MAX - 32;
-const MAX_LIVE: u32 = u32::MAX - 1;
-
-// Select from the actual dependency type, including Cargo feature unification.
-trait ShareMode {
-    type Marker;
-}
-impl ShareMode for std::sync::atomic::AtomicU32 {
-    type Marker = ();
-}
-impl ShareMode for pi_share::atomic::AtomicCell<u32> {
-    type Marker = std::rc::Rc<()>;
-}
-
+#[repr(C)]
 struct Slot<T> {
-    entry: UnsafeCell<MaybeUninit<(T, ShareU64)>>,
+    link: ShareU64,
+    entry: UnsafeCell<MaybeUninit<T>>,
     version: ShareU32,
-    single_thread: PhantomData<<ShareU32 as ShareMode>::Marker>,
 }
 
-// Only the payload field changes under shared access. The link is initialized
-// before publication and is never moved/rebuilt while late observers can exist.
-// The actual-type marker still prevents Send/Sync when pi_share selects RC.
-#[cfg(not(feature = "rc"))]
-unsafe impl<T: Send + Sync> Sync for Slot<T> {}
+// SAFETY: publication initializes T; unsafe mutation/removal requires external
+// exclusivity. The generic tuple bound checks the actual version atomic's Sync
+// even under upstream feature union; ThreadSync/serial cannot weaken it.
+// SlotMap derives its thread traits from its actual fields, with no blanket impl.
+unsafe impl<T: Send + Sync> Sync for Slot<T> where (T, ShareU32): Sync {}
 
 impl<T> Slot<T> {
-    fn entry_ptr(&self) -> *mut (T, ShareU64) {
-        self.entry.get().cast::<(T, ShareU64)>()
-    }
-
     fn value_ptr(&self) -> *mut T {
-        // Raw field projection does not assert initialization of T/the tuple.
-        unsafe { ptr::addr_of_mut!((*self.entry_ptr()).0) }
-    }
-
-    fn link(&self) -> &ShareU64 {
-        // Every allocated slot has an initialized link, even FREE/DEAD slots.
-        unsafe { &*ptr::addr_of!((*self.entry_ptr()).1) }
+        self.entry.get().cast::<T>()
     }
 }
-
 impl<T> Default for Slot<T> {
     fn default() -> Self {
-        let slot = Self {
+        Self {
+            link: ShareU64::new(NULL),
             entry: UnsafeCell::new(MaybeUninit::uninit()),
             version: ShareU32::new(1),
-            single_thread: PhantomData,
-        };
-        // Initialize only tuple.1. No T::default and no reference to the tuple.
-        // Default may move the empty shell before its containing bucket is published.
-        unsafe {
-            ptr::write(
-                ptr::addr_of_mut!((*slot.entry_ptr()).1),
-                ShareU64::new(NULL_FULL),
-            )
-        };
-        slot
-    }
-}
-
-impl<T> Drop for Slot<T> {
-    fn drop(&mut self) {
-        let version = self.version.load(Ordering::Relaxed);
-        let panic = if live(version) {
-            self.version.store(version + 1, Ordering::Relaxed);
-            // Slot destruction is exclusive; LIVE is the only ownership marker.
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                ptr::drop_in_place(self.value_ptr());
-            }))
-            .err()
-        } else {
-            None
-        };
-        // MaybeUninit does not drop its fields. Also drop RC's atomic object,
-        // independently of T initialization and even if T's destructor panics.
-        unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*self.entry_ptr()).1)) };
-        if let Some(payload) = panic {
-            std::panic::resume_unwind(payload);
         }
     }
 }
-
-fn live(version: u32) -> bool {
-    version >= 2 && version & 1 == 0
+impl<T> Drop for Slot<T> {
+    fn drop(&mut self) {
+        if live(*self.version.get_mut()) {
+            *self.version.get_mut() = u32::MAX;
+            // SAFETY: final exclusive owner; LIVE proves initialization. Ordinary
+            // field drop glue still destroys link if the value destructor unwinds.
+            unsafe { self.entry.get_mut().assume_init_drop() };
+        }
+    }
 }
-
-fn full_id(index: u32, version: u32) -> u64 {
+fn live(version: u32) -> bool {
+    version != 0 && version & 1 == 0 && version <= MAX_LIVE_VERSION
+}
+fn encode(index: u32, version: u32) -> u64 {
     (u64::from(version) << 32) | u64::from(index)
 }
-
 fn checked_key<K: Key>(index: u32, version: u32) -> K {
-    let data = KeyData::from_ffi(full_id(index, version));
+    let data = KeyData::from_ffi(encode(index, version));
     assert_eq!(
         (data.index(), data.version()),
         (index, version),
@@ -141,60 +99,85 @@ fn checked_key<K: Key>(index: u32, version: u32) -> K {
     key
 }
 
-/// Stable addresses, full index32/version32 keys, no T: Default requirement.
-/// Keys belong to their originating map; there is no additional map identity.
-/// Default atomics allow shared insertion/reading when K and T support Send/Sync.
-/// This is not a strictly lock-free container: bucket allocation can lock.
+/// 版本化槽表，完整 index32/version32 key 仅属于原表。
+/// 初始 FREE=1，LIVE=2,4,..,MAX-1；FREE=3,5,..,MAX；MAX 永久耗尽。
+#[repr(C)]
 pub struct SlotMap<K: Key = DefaultKey, T = ()> {
-    slots: SegmentedArr<Slot<T>>,
-    head: ShareU64,
-    nextindex: ShareU32,
-    // LIVE plus short pre-publication reservations; never cumulative.
-    count: ShareU64,
-    key: PhantomData<K>,
-    single_thread: PhantomData<<ShareU32 as ShareMode>::Marker>,
+    free_head: ShareU64,
+    slots: Arr<Slot<T>>,
+    #[cfg(feature = "stats")]
+    alloc: CachePadded<ShareUsize>,
+    #[cfg(feature = "stats")]
+    free: CachePadded<ShareUsize>,
+    next_index: ShareU32,
+    key_type: PhantomData<K>,
 }
-
-// An empty, detached candidate owns no T. User key callbacks may unwind or
-// reenter the map: rollback consumes a generation, never republishes its old id.
 struct Candidate<'a, K: Key, T> {
     map: &'a SlotMap<K, T>,
     slot: &'a Slot<T>,
     index: u32,
+    // Zero means committed. Every abandoned candidate consumes its generation.
     version: u32,
-    armed: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReserveError {
+    IndexRejected,
+    IndexExhausted,
+}
+/// 空槽唯一写入者；所有用户回调和键校验在写 T 之前完成。
+/// 放弃消耗 generation；forget 只泄漏未初始化空槽。
+/// ```compile_fail
+/// use pi_slot::{DefaultKey, SlotMap};
+/// let writer = {
+///     let map = SlotMap::<DefaultKey, u32>::new();
+///     map.try_reserve_if(|_| true).unwrap()
+/// };
+/// writer.insert(1);
+/// ```
+pub struct SlotWriter<'a, K: Key, T> {
+    candidate: Candidate<'a, K, T>,
+    key: K,
+}
+impl<K: Key, T> SlotWriter<'_, K, T> {
+    pub fn insert(self, value: T) -> K {
+        self.insert_with_link(value, 0)
+    }
+    pub fn insert_with_link(mut self, value: T, link: u64) -> K {
+        // SAFETY: candidate exclusively owns uninitialized T, all callbacks done.
+        unsafe { ptr::write(self.candidate.slot.value_ptr(), value) };
+        self.candidate.slot.link.store(link, Ordering::Relaxed);
+        self.candidate
+            .slot
+            .version
+            .store(self.candidate.version, Ordering::Release);
+        self.candidate.version = 0;
+        #[cfg(feature = "stats")]
+        self.candidate.map.alloc.fetch_add(1, Ordering::Relaxed);
+        self.key
+    }
 }
 impl<K: Key, T> Drop for Candidate<'_, K, T> {
     fn drop(&mut self) {
-        if self.armed {
-            self.map.recycle(self.slot, self.index, self.version);
+        if self.version != 0 {
+            self.slot.version.store(self.version + 1, Ordering::Release);
+            self.map.push_free(self.index, self.slot);
         }
     }
 }
-
 impl<K: Key, T> Default for SlotMap<K, T> {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl<K: Key, T> Drop for SlotMap<K, T> {
     fn drop(&mut self) {
         let mut first_panic = None;
-        let end = self
-            .slots
-            .contiguous_len()
-            .saturating_add(MAX_SLOTS as usize + 1);
-        // Remove all payload ownership before the segmented storage destroys
-        // its buckets. One user's panic must not skip later buckets/links.
-        for segment in self.slots.segments(0..end) {
+        for segment in self.slots.segments(0..MAX_ENTRIES + 1) {
             for slot in segment {
-                let version = slot.version.load(Ordering::Relaxed);
-                if !live(version) {
+                if !live(slot.version.swap(u32::MAX, Ordering::Relaxed)) {
                     continue;
                 }
-                slot.version.store(version + 1, Ordering::Relaxed);
-                // Exclusive destruction and LIVE prove T initialization.
+                // SAFETY: exclusive final owner; revoke LIVE before moving T out.
                 let value = unsafe { ptr::read(slot.value_ptr()) };
                 if let Err(payload) =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
@@ -207,186 +190,171 @@ impl<K: Key, T> Drop for SlotMap<K, T> {
                 }
             }
         }
+        // All slot versions are non-LIVE; normal field drop cannot drop T twice.
         if let Some(payload) = first_panic {
             std::panic::resume_unwind(payload);
         }
     }
 }
-
 impl<K: Key, T> SlotMap<K, T> {
-    /// Empty map, without constructing T.
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
-
-    /// Preallocate initialized empty shells. Panics above the index limit.
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(
-            capacity <= MAX_SLOTS as usize,
+            capacity <= MAX_ENTRIES,
             "SlotMap capacity exceeds index limit"
         );
         Self {
-            slots: SegmentedArr::with_capacity(capacity),
-            head: ShareU64::new(NULL_FULL),
-            nextindex: ShareU32::new(0),
-            count: ShareU64::new(0),
-            key: PhantomData,
-            single_thread: PhantomData,
+            free_head: ShareU64::new(NULL),
+            slots: Arr::with_capacity(capacity),
+            #[cfg(feature = "stats")]
+            alloc: CachePadded::new(ShareUsize::new(0)),
+            #[cfg(feature = "stats")]
+            free: CachePadded::new(ShareUsize::new(0)),
+            next_index: ShareU32::new(0),
+            key_type: PhantomData,
         }
     }
-
-    fn claim(&self) -> Candidate<'_, K, T> {
+    fn pop_free(&self) -> Option<u32> {
         loop {
-            let head = self.head.load(Ordering::Acquire);
-            if head != NULL_FULL {
-                // Only head is dereferenced, never the edge before a successful
-                // CAS. A late observer may read arbitrary LIVE user link bits.
-                // The allocation outlives every observer; its atomic is permanent.
-                let index = head as u32;
-                let slot = self.slots.get(index as usize).expect("FREE slot allocated");
-                let next = slot.link().load(Ordering::Relaxed);
-                if self
-                    .head
-                    .compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    continue;
-                }
-                // Successful CAS proves this FREE incarnation never detached
-                // between head/edge reads. No one else can change its version.
-                let version = (head >> 32) as u32;
-                let candidate = Candidate {
-                    map: self,
-                    slot,
-                    index,
-                    version: version + 1,
-                    armed: true,
-                };
-                assert_eq!(
-                    slot.version.load(Ordering::Acquire),
-                    version,
-                    "FREE generation mismatch"
-                );
-                return candidate;
+            let head = self.free_head.load(Ordering::Acquire);
+            if head == NULL {
+                return None;
             }
-            let index = self.nextindex.load(Ordering::Acquire);
-            assert!(index < MAX_SLOTS, "SlotMap index limit exhausted");
-            // Allocate BEFORE claiming the index, so allocation unwind cannot
-            // strand an unallocated candidate. Competing allocators share a bucket.
-            let pointer = self.slots.load_alloc_ptr(index as usize);
+            let index = head as u32;
+            let slot = self.slots.get(index as usize).expect("FREE slot allocated");
+            // A late observer may read arbitrary LIVE user bits. Never dereference
+            // next or validate its target before the full-id CAS succeeds. Every
+            // detached id is consumed, so this stale CAS must fail without ABA.
+            let next = slot.link.load(Ordering::Relaxed);
             if self
-                .nextindex
-                .compare_exchange(index, index + 1, Ordering::AcqRel, Ordering::Acquire)
+                .free_head
+                .compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // Initialized stable shell, no mutable reference to Slot.
-                let slot = unsafe { &*pointer };
-                return Candidate {
+                return Some(index);
+            }
+        }
+    }
+    fn claim(
+        &self,
+        mut predicate: impl FnMut(u32) -> bool,
+    ) -> Result<Candidate<'_, K, T>, ReserveError> {
+        while let Some(index) = self.pop_free() {
+            let slot = self.slots.get(index as usize).expect("popped FREE slot");
+            let version = slot.version.load(Ordering::Relaxed);
+            if version == u32::MAX {
+                continue;
+            }
+            return Ok(Candidate {
+                map: self,
+                slot,
+                index,
+                version: version + 1,
+            });
+        }
+        let result = self
+            .next_index
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |index| {
+                if index as usize >= MAX_ENTRIES {
+                    return None;
+                }
+                if !predicate(index) {
+                    return None;
+                }
+                // The rc backend updates from a saved value after the callback;
+                // reentry must not overwrite an index claimed by the callback.
+                #[cfg(feature = "rc")]
+                if self.next_index.load(Ordering::Relaxed) != index {
+                    return None;
+                }
+                Some(index + 1)
+            });
+        match result {
+            Ok(index) => {
+                // SAFETY: last successful callback allocated this stable shell;
+                let slot = unsafe { &*self.slots.load_alloc_ptr(index as usize) };
+                Ok(Candidate {
                     map: self,
                     slot,
                     index,
                     version: 2,
-                    armed: true,
-                };
+                })
             }
+            Err(index) if index as usize >= MAX_ENTRIES => Err(ReserveError::IndexExhausted),
+            Err(_) => Err(ReserveError::IndexRejected),
         }
     }
-
-    fn recycle(&self, slot: &Slot<T>, index: u32, live_version: u32) {
-        let version = live_version + 1;
-        // Empty T, permanent atomic remains initialized. Last generation is DEAD.
-        slot.version.store(version, Ordering::Release);
-        if live_version == MAX_LIVE {
-            return;
-        }
-        let id = full_id(index, version);
-        let mut head = self.head.load(Ordering::Acquire);
+    fn push_free(&self, index: u32, slot: &Slot<T>) {
+        let id = encode(index, slot.version.load(Ordering::Relaxed));
+        let mut head = self.free_head.load(Ordering::Acquire);
         loop {
-            slot.link().store(head, Ordering::Relaxed);
-            match self
-                .head
-                .compare_exchange_weak(head, id, Ordering::AcqRel, Ordering::Acquire)
-            {
+            slot.link.store(head, Ordering::Relaxed);
+            match self.free_head.compare_exchange_weak(
+                head,
+                id,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(current) => head = current,
             }
         }
     }
-
-    /// Shared insertion with link=0. May run alongside safe reads/iteration.
+    pub fn try_reserve_if(
+        &self,
+        predicate: impl FnMut(u32) -> bool,
+    ) -> Result<SlotWriter<'_, K, T>, ReserveError> {
+        let candidate = self.claim(predicate)?;
+        let key = checked_key(candidate.index, candidate.version);
+        Ok(SlotWriter { candidate, key })
+    }
     pub fn insert(&self, value: T) -> K {
         self.insert_with_link(value, 0)
     }
-
-    /// Shared insertion. Index exhaustion or unrepresentable/panicking keys
-    /// panic before T initialization; rollback consumes a generation.
     pub fn insert_with_link(&self, value: T, link: u64) -> K {
-        let mut candidate = self.claim();
-        let key = checked_key::<K>(candidate.index, candidate.version);
-        // Reserve only after all user callbacks succeeded. This counter is
-        // bounded by the finite slot population, not lifetime insertions.
-        // Failure unwinds the empty candidate before T initialization.
-        let mut count = self.count.load(Ordering::Relaxed);
-        loop {
-            assert!(
-                count < u64::from(MAX_SLOTS),
-                "SlotMap live counter exhausted"
-            );
-            match self.count.compare_exchange_weak(
-                count,
-                count + 1,
-                // Publish prior index claims to len() before it observes count.
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => count = current,
-            }
-        }
-        // No fallible/user operations between reservation and LIVE publication.
-        unsafe { ptr::write(candidate.slot.value_ptr(), value) };
-        candidate.slot.link().store(link, Ordering::Relaxed);
-        candidate
-            .slot
-            .version
-            .store(candidate.version, Ordering::Release);
-        candidate.armed = false;
-        key
+        self.try_reserve_if(|_| true)
+            .unwrap_or_else(|_| panic!("SlotMap index limit exhausted"))
+            .insert_with_link(value, link)
     }
-
-    /// Exclusive insertion alias with link=0.
+    pub fn alloc(&self, value: T) -> Result<K, T> {
+        self.alloc_with_link(value, 0).map_err(|(value, _)| value)
+    }
+    pub fn alloc_with_link(&self, value: T, link: u64) -> Result<K, (T, u64)> {
+        match self.try_reserve_if(|_| true) {
+            Ok(writer) => Ok(writer.insert_with_link(value, link)),
+            Err(_) => Err((value, link)),
+        }
+    }
     pub fn set(&mut self, value: T) -> K {
         self.insert(value)
     }
-    /// Exclusive insertion alias with the specified link.
     pub fn set_with_link(&mut self, value: T, link: u64) -> K {
         self.insert_with_link(value, link)
     }
-
-    /// Quiescent exact LIVE count; concurrent calls may include a brief insertion
-    /// reservation or a value whose removal is not yet accounted for. No underflow.
+    /// O(max) version scan, not a consistent concurrent snapshot. No key callbacks.
     pub fn len(&self) -> usize {
-        self.count.load(Ordering::Acquire) as usize
+        self.slots
+            .segments(0..self.max() as usize)
+            .flat_map(|segment| segment.iter())
+            .filter(|slot| live(slot.version.load(Ordering::Acquire)))
+            .count()
     }
-    /// Index high-water mark, including failed candidates and retired slots.
-    pub fn max(&self) -> u32 {
-        self.nextindex.load(Ordering::Acquire)
-    }
-    /// Approximate concurrently, exact when quiescent.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Allocated slot storage plus Self, excluding indirect T allocations and
-    /// allocator metadata. Scans segments; approximate during concurrent growth.
-    pub fn mem_size(&self) -> usize {
-        let end = self.slots.capacity_for_len(self.max() as usize);
-        let count: usize = self.slots.segments(0..end).map(|slice| slice.len()).sum();
-        count
-            .saturating_mul(size_of::<Slot<T>>())
-            .saturating_add(size_of::<Self>())
+    #[cfg(feature = "stats")]
+    pub fn alloc_count(&self) -> usize {
+        self.alloc.load(Ordering::Relaxed)
     }
-
+    #[cfg(feature = "stats")]
+    pub fn free_count(&self) -> usize {
+        self.free.load(Ordering::Relaxed)
+    }
+    pub fn max(&self) -> u32 {
+        self.next_index.load(Ordering::Acquire)
+    }
     fn find(&self, data: KeyData) -> Option<&Slot<T>> {
         if !live(data.version()) || data.index() >= self.max() {
             return None;
@@ -394,123 +362,111 @@ impl<K: Key, T> SlotMap<K, T> {
         let slot = self.slots.get(data.index() as usize)?;
         (slot.version.load(Ordering::Acquire) == data.version()).then_some(slot)
     }
-
-    /// Read a matching LIVE tuple. The shared link supports atomic operations.
-    pub fn get(&self, key: K) -> Option<&(T, ShareU64)> {
+    pub fn get(&self, key: K) -> Option<(&T, &ShareU64)> {
         let slot = self.find(key.data())?;
-        // Acquire observed both initialized fields; safe removal requires &mut self.
-        Some(unsafe { &*slot.entry_ptr() })
+        // SAFETY: LIVE Acquire observes T; safe removal needs exclusive map.
+        Some((unsafe { &*slot.value_ptr() }, &slot.link))
     }
-
-    /// Exclusive tuple access, including replacement of the atomic object.
-    pub fn get_mut(&mut self, key: K) -> Option<&mut (T, ShareU64)> {
-        let slot = self.find(key.data())?;
-        // Exclusive table access excludes late pop observers and all other borrows.
-        Some(unsafe { &mut *slot.entry_ptr() })
+    pub fn get_mut(&mut self, key: K) -> Option<(&mut T, &mut ShareU64)> {
+        let data = key.data();
+        self.find(data)?;
+        let slot = self.slots.get_mut(data.index() as usize)?;
+        // SAFETY: exclusive slot and LIVE proves initialized T.
+        Some((
+            unsafe { slot.entry.get_mut().assume_init_mut() },
+            &mut slot.link,
+        ))
     }
-
-    /// Shared-table access to exclusive T and shared permanent link.
     /// # Safety
-    /// T must be exclusively borrowed for the entire returned lifetime, without
-    /// conflicting get/iter/replace/remove. Synchronize across threads. All returned
-    /// references (including link) must end before removal or table destruction.
-    /// Atomic-only link access may coexist; RC permits single-thread access only.
+    /// T must be exclusively borrowed; all returned references must end before
+    /// removal, reuse or destruction. External synchronization is required.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_shared(&self, key: K) -> Option<(&mut T, &ShareU64)> {
         let slot = self.find(key.data())?;
-        // Only T is mutably borrowed, never the whole tuple or Slot.
-        Some((unsafe { &mut *slot.value_ptr() }, slot.link()))
+        // SAFETY: caller excludes conflicting T accesses; permanent link shared.
+        Some((unsafe { &mut *slot.value_ptr() }, &slot.link))
     }
-
-    /// Unchecked shared read.
     /// # Safety
-    /// Key must denote an initialized LIVE slot in this map. No conflicting
-    /// payload modification/removal during the returned lifetime.
-    pub unsafe fn get_unchecked(&self, key: K) -> &(T, ShareU64) {
+    /// Valid initialized LIVE key; no conflicting mutation/removal until refs end.
+    pub unsafe fn get_unchecked(&self, key: K) -> (&T, &ShareU64) {
+        // SAFETY: valid LIVE key required by caller.
         let slot = unsafe { self.slots.get_unchecked(key.data().index() as usize) };
         slot.version.load(Ordering::Acquire);
-        unsafe { &*slot.entry_ptr() }
+        (unsafe { &*slot.value_ptr() }, &slot.link)
     }
-
-    /// Unchecked exclusive tuple access.
     /// # Safety
-    /// Key must denote an initialized LIVE slot in this map.
-    pub unsafe fn get_unchecked_mut(&mut self, key: K) -> &mut (T, ShareU64) {
-        let slot = unsafe { self.slots.get_unchecked(key.data().index() as usize) };
-        slot.version.load(Ordering::Acquire);
-        unsafe { &mut *slot.entry_ptr() }
+    /// Valid initialized LIVE key in this exclusively borrowed map.
+    pub unsafe fn get_unchecked_mut(&mut self, key: K) -> (&mut T, &mut ShareU64) {
+        // SAFETY: caller supplies valid key, map is exclusive.
+        let slot = self
+            .slots
+            .get_mut(key.data().index() as usize)
+            .expect("valid LIVE key");
+        unsafe { (slot.entry.get_mut().assume_init_mut(), &mut slot.link) }
     }
-
-    /// Unchecked shared-table exclusive T access.
     /// # Safety
-    /// Valid LIVE key and the full get_shared lifetime/synchronization contract.
+    /// Valid LIVE key and the complete get_shared exclusivity/lifetime contract.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_shared_unchecked(&self, key: K) -> (&mut T, &ShareU64) {
         let slot = unsafe { self.slots.get_unchecked(key.data().index() as usize) };
         slot.version.load(Ordering::Acquire);
-        (unsafe { &mut *slot.value_ptr() }, slot.link())
+        (unsafe { &mut *slot.value_ptr() }, &slot.link)
     }
-
-    /// Remove and return T, invalidating the key.
     pub fn remove(&mut self, key: K) -> Option<T> {
         unsafe { self.remove_shared(key) }
     }
-    /// Remove and return T and a snapshot of the user link.
     pub fn remove_with_link(&mut self, key: K) -> Option<(T, u64)> {
         unsafe { self.remove_shared_with_link(key) }
     }
-
-    /// Shared removal without destroying the permanent atomic object.
     /// # Safety
-    /// The target slot has no outstanding references (including link), conflicting
-    /// readers/writers or iterators scanning it. External synchronization is required
-    /// across threads. Internal late FREE observers are permitted by the protocol.
+    /// All target T/link references must have ended; exclude conflicting access
+    /// and scans, synchronize across threads. Internal late FREE observers allowed.
     pub unsafe fn remove_shared(&self, key: K) -> Option<T> {
         unsafe { self.remove_shared_with_link(key) }.map(|(value, _)| value)
     }
-
-    /// Shared removal with link snapshot.
     /// # Safety
-    /// Same complete exclusion/lifetime contract as remove_shared.
+    /// Same exclusivity and ended-reference contract as remove_shared.
     pub unsafe fn remove_shared_with_link(&self, key: K) -> Option<(T, u64)> {
         let data = key.data();
         let slot = self.find(data)?;
-        let link = slot.link().load(Ordering::Relaxed);
-        slot.version.store(data.version() + 1, Ordering::Release);
-        // Exclusive payload contract and LIVE prove initialized T. Only T moves.
+        if slot
+            .version
+            .compare_exchange(
+                data.version(),
+                data.version() + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let link = slot.link.load(Ordering::Relaxed);
+        // SAFETY: caller excludes all conflicting references; unique CAS owns T.
         let value = unsafe { ptr::read(slot.value_ptr()) };
-        // Each LIVE publication reserved one count. Decrement before publishing
-        // FREE, so reuse cannot accumulate reservations beyond the slot population.
-        self.count.fetch_sub(1, Ordering::Relaxed);
-        self.recycle(slot, data.index(), data.version());
+        self.push_free(data.index(), slot);
+        #[cfg(feature = "stats")]
+        self.free.fetch_add(1, Ordering::Relaxed);
         Some((value, link))
     }
-
-    /// Replace T only, preserving version and link. Old T on success, new T on error.
     pub fn replace(&mut self, key: K, value: T) -> Result<T, T> {
         unsafe { self.replace_shared(key, value) }
     }
-    /// Replace T and link bits, returning the old/new pair on success/error.
     pub fn replace_with_link(&mut self, key: K, value: T, link: u64) -> Result<(T, u64), (T, u64)> {
         unsafe { self.replace_shared_with_link(key, value, link) }
     }
-
-    /// Shared replacement of T only; permanent link and generation are unchanged.
     /// # Safety
-    /// No conflicting payload references, modification, removal or scanning.
-    /// Cross-thread access requires synchronization. Atomic link operations may coexist.
+    /// Exclude all conflicting T references, mutation, deletion and scanning.
     pub unsafe fn replace_shared(&self, key: K, value: T) -> Result<T, T> {
         let Some(slot) = self.find(key.data()) else {
             return Err(value);
         };
-        // Only T moves, under the caller's payload exclusion guarantee.
+        // SAFETY: caller ensures initialized T is exclusively accessed.
         Ok(unsafe { ptr::replace(slot.value_ptr(), value) })
     }
-
-    /// Shared replacement with an old link snapshot; never replaces the atomic object.
     /// # Safety
-    /// replace_shared's payload contract, plus no concurrent user link operations
-    /// during this operation. Internal late FREE observers remain permitted.
+    /// replace_shared contract plus no concurrent user link operations. Late
+    /// internal FREE observers may still load the permanent link's arbitrary bits.
     pub unsafe fn replace_shared_with_link(
         &self,
         key: K,
@@ -520,13 +476,11 @@ impl<K: Key, T> SlotMap<K, T> {
         let Some(slot) = self.find(key.data()) else {
             return Err((value, link));
         };
-        let old_link = slot.link().load(Ordering::Relaxed);
+        let old_link = slot.link.load(Ordering::Relaxed);
         let old = unsafe { ptr::replace(slot.value_ptr(), value) };
-        slot.link().store(link, Ordering::Relaxed);
+        slot.link.store(link, Ordering::Relaxed);
         Ok((old, old_link))
     }
-
-    /// Weakly consistent Acquire scan with frozen max upper bound, not a snapshot.
     pub fn iter(&self) -> Iter<'_, K, T> {
         Iter {
             map: self,
@@ -534,26 +488,22 @@ impl<K: Key, T> SlotMap<K, T> {
             end: self.max(),
         }
     }
-    /// Exclusive tuple iteration; each index appears once and references may coexist.
     pub fn iter_mut(&mut self) -> IterMut<'_, K, T> {
         IterMut {
-            end: self.max(),
-            slots: &mut self.slots,
-            next: 0,
+            slots: self.slots.slice_mut(0..self.max() as usize),
             borrow: PhantomData,
         }
     }
 }
-
 impl<K: Key, T> Index<K> for SlotMap<K, T> {
-    type Output = (T, ShareU64);
-    fn index(&self, key: K) -> &Self::Output {
-        self.get(key).expect("invalid SlotMap key")
+    type Output = T;
+    fn index(&self, key: K) -> &T {
+        self.get(key).expect("invalid SlotMap key").0
     }
 }
 impl<K: Key, T> IndexMut<K> for SlotMap<K, T> {
-    fn index_mut(&mut self, key: K) -> &mut Self::Output {
-        self.get_mut(key).expect("invalid SlotMap key")
+    fn index_mut(&mut self, key: K) -> &mut T {
+        self.get_mut(key).expect("invalid SlotMap key").0
     }
 }
 impl<K: Key, T: Debug> Debug for SlotMap<K, T> {
@@ -561,15 +511,13 @@ impl<K: Key, T: Debug> Debug for SlotMap<K, T> {
         formatter.debug_map().entries(self.iter()).finish()
     }
 }
-
-/// Read-only weak scan, with frozen index upper bound.
 pub struct Iter<'a, K: Key, T> {
     map: &'a SlotMap<K, T>,
     next: u32,
     end: u32,
 }
 impl<'a, K: Key, T> Iterator for Iter<'a, K, T> {
-    type Item = (K, &'a (T, ShareU64));
+    type Item = (K, (&'a T, &'a ShareU64));
     fn next(&mut self) -> Option<Self::Item> {
         while self.next < self.end {
             let index = self.next;
@@ -578,9 +526,8 @@ impl<'a, K: Key, T> Iterator for Iter<'a, K, T> {
             let version = slot.version.load(Ordering::Acquire);
             if live(version) {
                 let key = checked_key(index, version);
-                // Acquire proves both tuple fields initialized; unsafe callers
-                // must exclude conflicting payload changes/removal while scanning.
-                return Some((key, unsafe { &*slot.entry_ptr() }));
+                // SAFETY: LIVE published T; removal cannot overlap this scan.
+                return Some((key, (unsafe { &*slot.value_ptr() }, &slot.link)));
             }
         }
         None
@@ -589,32 +536,29 @@ impl<'a, K: Key, T> Iterator for Iter<'a, K, T> {
         (0, Some((self.end - self.next) as usize))
     }
 }
-
-/// Exclusive unique-index scan, without mutable references to LIVE slots.
 pub struct IterMut<'a, K: Key, T> {
-    slots: *mut SegmentedArr<Slot<T>>,
-    next: u32,
-    end: u32,
+    slots: pi_arr::IterMut<'a, Slot<T>>,
     borrow: PhantomData<&'a mut SlotMap<K, T>>,
 }
 impl<'a, K: Key, T> Iterator for IterMut<'a, K, T> {
-    type Item = (K, &'a mut (T, ShareU64));
+    type Item = (K, (&'a mut T, &'a mut ShareU64));
     fn next(&mut self) -> Option<Self::Item> {
-        while self.next < self.end {
-            let index = self.next;
-            self.next += 1;
-            // Exclusive table borrow stays alive; shared Slot accesses touch
-            // metadata outside UnsafeCell, not any previously returned tuple.
-            let slot = unsafe { (&*self.slots).get(index as usize)? };
+        while let Some((index, slot)) = self.slots.next() {
             let version = slot.version.load(Ordering::Acquire);
             if live(version) {
-                let key = checked_key(index, version);
-                return Some((key, unsafe { &mut *slot.entry_ptr() }));
+                let key = checked_key(index as u32, version);
+                return Some((
+                    key,
+                    (
+                        unsafe { slot.entry.get_mut().assume_init_mut() },
+                        &mut slot.link,
+                    ),
+                ));
             }
         }
         None
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some((self.end - self.next) as usize))
+        (0, self.slots.size_hint().1)
     }
 }
