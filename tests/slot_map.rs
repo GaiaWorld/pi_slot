@@ -7,7 +7,51 @@ use std::sync::{
 };
 
 fn key(index: u32, version: u32) -> DefaultKey {
-    KeyData::from_ffi((u64::from(version) << 32) | u64::from(index)).into()
+    KeyData::new(index, version).into()
+}
+
+#[test]
+fn writer_exposes_key_before_insertion() {
+    let map = SlotMap::<DefaultKey, (DefaultKey, u32)>::new();
+    let writer = map.try_insert_if(|_| true).unwrap();
+    let key = writer.key();
+    assert_eq!(writer.key(), key);
+    assert!(map.get(key).is_none());
+    assert_eq!(writer.insert((key, 42)), key);
+    assert_eq!(map.get(key).unwrap().0, &(key, 42));
+}
+
+#[test]
+fn insert_with_key_constructs_self_referential_value_before_publication() {
+    let map = SlotMap::<DefaultKey, (DefaultKey, u32)>::new();
+    let first = map.insert_with_key(|key| {
+        assert!(map.get(key).is_none());
+        (key, 10)
+    });
+    assert_eq!(map.get(first).unwrap().0, &(first, 10));
+
+    let second = map.try_insert_with_key::<()>(|key| {
+        assert!(map.get(key).is_none());
+        Ok((key, 20))
+    }).unwrap();
+    assert_eq!(map.get(second).unwrap().0, &(second, 20));
+}
+
+#[test]
+fn fallible_key_insertion_rolls_back_without_publishing_value() {
+    let map = SlotMap::<DefaultKey, DefaultKey>::new();
+    let rejected = std::cell::Cell::new(None);
+    assert_eq!(map.try_insert_with_key(|key| {
+        rejected.set(Some(key));
+        Err::<DefaultKey, _>("rejected")
+    }), Err("rejected"));
+    let rejected = rejected.get().unwrap();
+    assert!(map.get(rejected).is_none());
+    assert_eq!((map.max(), map.len()), (1, 0));
+    let accepted = map.insert_with_key(|key| key);
+    assert_eq!(accepted.data().index(), rejected.data().index());
+    assert_eq!(accepted.data().version(), rejected.data().version() + 2);
+    assert_eq!(map.get(accepted).unwrap().0, &accepted);
 }
 
 #[test]
@@ -15,7 +59,7 @@ fn rejected_reservation_does_not_construct_payload_or_consume_index() {
     let map = SlotMap::<DefaultKey, DropValue>::new();
     let constructed = AtomicUsize::new(0);
     let drops = Arc::new(AtomicUsize::new(0));
-    let result = map.try_reserve_if(|index| {
+    let result = map.try_insert_if(|index| {
         assert_eq!(index, 0);
         false
     });
@@ -38,7 +82,7 @@ fn rc_predicate_reentry_cannot_overwrite_initialized_slot() {
     let drops = Arc::new(AtomicUsize::new(0));
     let map = SlotMap::<DefaultKey, DropValue>::new();
     let mut nested = None;
-    let result = map.try_reserve_if(|index| {
+    let result = map.try_insert_if(|index| {
         assert_eq!(index, 0);
         nested = Some(map.insert(DropValue(drops.clone())));
         true
@@ -54,23 +98,23 @@ fn rc_predicate_reentry_cannot_overwrite_initialized_slot() {
 #[test]
 fn writer_rollback_and_free_reuse_bypass_limit_without_statistics() {
     let mut map = SlotMap::<DefaultKey, String>::new();
-    let writer = map.try_reserve_if(|index| index < 1).unwrap();
+    let writer = map.try_insert_if(|index| index < 1).unwrap();
     assert_eq!((map.len(), map.max(), map.iter().count()), (0, 1, 0));
     assert!(matches!(
-        map.try_reserve_if(|index| index < 1),
+        map.try_insert_if(|index| index < 1),
         Err(ReserveError::IndexRejected)
     ));
     drop(writer);
     assert_eq!((map.len(), map.max()), (0, 1));
     let first = map
-        .try_reserve_if(|_| panic!("FREE must bypass predicate"))
+        .try_insert_if(|_| panic!("FREE must bypass predicate"))
         .unwrap()
         .insert_with_link("first".into(), u64::MAX);
     assert_eq!((first.data().index(), first.data().version()), (0, 4));
     assert_eq!(map.get(first).unwrap().1.load(Ordering::Relaxed), u64::MAX);
     assert_eq!(map.remove(first), Some("first".into()));
     let second = map
-        .try_reserve_if(|_| false)
+        .try_insert_if(|_| false)
         .unwrap()
         .insert("second".into());
     assert_eq!(second.data().version(), 6);
@@ -84,18 +128,18 @@ fn writer_rollback_and_free_reuse_bypass_limit_without_statistics() {
 fn predicate_panic_and_payload_constructor_panic_restore_empty_slot() {
     let map = SlotMap::<DefaultKey, String>::new();
     assert!(catch_unwind(AssertUnwindSafe(|| {
-        let _ = map.try_reserve_if(|_| panic!("predicate"));
+        let _ = map.try_insert_if(|_| panic!("predicate"));
     }))
     .is_err());
     assert_eq!((map.len(), map.max()), (0, 0));
     assert!(catch_unwind(AssertUnwindSafe(|| {
-        let _writer = map.try_reserve_if(|index| index < 1).unwrap();
+        let _writer = map.try_insert_if(|index| index < 1).unwrap();
         panic!("constructor before commit");
     }))
     .is_err());
     assert_eq!((map.len(), map.max()), (0, 1));
     let key = map
-        .try_reserve_if(|_| false)
+        .try_insert_if(|_| false)
         .unwrap()
         .insert("restored".into());
     assert_eq!(key.data().version(), 4);
@@ -106,9 +150,9 @@ fn predicate_panic_and_payload_constructor_panic_restore_empty_slot() {
 fn forgotten_writer_is_an_empty_uncounted_safe_leak() {
     let drops = Arc::new(AtomicUsize::new(0));
     let map = SlotMap::<DefaultKey, DropValue>::new();
-    std::mem::forget(map.try_reserve_if(|_| true).unwrap());
+    std::mem::forget(map.try_insert_if(|_| true).unwrap());
     assert_eq!((map.len(), map.max(), map.iter().count()), (0, 1, 0));
-    map.try_reserve_if(|_| true)
+    map.try_insert_if(|_| true)
         .unwrap()
         .insert(DropValue(drops.clone()));
     assert_eq!(map.len(), 1);
@@ -132,7 +176,7 @@ fn fresh_index_cas_retry_rechecks_limits_one_and_two() {
                     let calls = &calls;
                     scope.spawn(move || {
                         let mut first = true;
-                        map.try_reserve_if(|index| {
+                        map.try_insert_if(|index| {
                             calls.fetch_add(1, Ordering::Relaxed);
                             if first {
                                 first = false;

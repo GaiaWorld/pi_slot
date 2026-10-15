@@ -1,6 +1,8 @@
-//! 版本化槽表。FREE link 保存完整标识，LIVE link 属于用户。
-//! 删除前必须终止所有目标槽引用；本库不提供 EBR 或两阶段退休。
-//! 默认 len/is_empty 扫描版本，复杂度 O(max)，并发时不是一致性快照。
+//! 支持通过共享引用插入的版本化槽表。
+//! FREE 槽的 link 保存空闲链标识；LIVE 槽的 link 由用户使用。
+//! 共享插入不意味着可以并发删除或修改 T：删除前必须终止目标槽的所有引用，
+//! 本库不提供 EBR 或两阶段退休。
+//! len/is_empty 扫描已有槽位，复杂度 O(max)，并发时不提供一致性快照。
 //! ```compile_fail
 //! use pi_slot::{DefaultKey, SlotMap};
 //! let map = SlotMap::<DefaultKey, u32>::new();
@@ -84,12 +86,7 @@ fn encode(index: u32, version: u32) -> u64 {
     (u64::from(version) << 32) | u64::from(index)
 }
 fn checked_key<K: Key>(index: u32, version: u32) -> K {
-    let data = KeyData::from_ffi(encode(index, version));
-    assert_eq!(
-        (data.index(), data.version()),
-        (index, version),
-        "KeyData encoding must preserve full generation"
-    );
+    let data = KeyData::new(index, version);
     let key = K::from(data);
     assert_eq!(
         key.data(),
@@ -99,8 +96,13 @@ fn checked_key<K: Key>(index: u32, version: u32) -> K {
     key
 }
 
-/// 版本化槽表，完整 index32/version32 key 仅属于原表。
-/// 初始 FREE=1，LIVE=2,4,..,MAX-1；FREE=3,5,..,MAX；MAX 永久耗尽。
+/// 可通过共享引用插入的版本化槽表。键由 32 位索引和 32 位版本组成。
+///
+/// 使用保留完整索引与版本的键类型（如 DefaultKey）；仅保存索引的键类型
+/// 无法表示本表的版本，生成键时会 panic。不同表的键不具备实例身份校验。
+/// 初始空槽版本为 1，存活版本为 2、4、...、u32::MAX - 1；耗尽后不再复用该槽。
+/// 共享插入可与读取并行；安全删除、替换与可变借用依赖 &mut self，
+/// 共享引用上的删除和替换仅在调用者满足各自的安全前提时可用。
 #[repr(C)]
 pub struct SlotMap<K: Key = DefaultKey, T = ()> {
     free_head: ShareU64,
@@ -120,17 +122,22 @@ struct Candidate<'a, K: Key, T> {
     version: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 认领空槽失败的原因。
 pub enum ReserveError {
+    /// 新索引未通过 predicate；已有的空闲槽不会调用 predicate。
     IndexRejected,
+    /// 新索引已达上限且没有可复用的空闲槽。
     IndexExhausted,
 }
-/// 空槽唯一写入者；所有用户回调和键校验在写 T 之前完成。
-/// 放弃消耗 generation；forget 只泄漏未初始化空槽。
+/// 已认领但尚未写入值的槽位写入者。
+///
+/// 可先通过 key 取得预定键来构造含自身键的值；提交前该键不可用于读取值。
+/// 放弃写入者会消耗一代版本；forget 只泄漏未初始化的空槽。
 /// ```compile_fail
 /// use pi_slot::{DefaultKey, SlotMap};
 /// let writer = {
 ///     let map = SlotMap::<DefaultKey, u32>::new();
-///     map.try_reserve_if(|_| true).unwrap()
+///     map.try_insert_if(|_| true).unwrap()
 /// };
 /// writer.insert(1);
 /// ```
@@ -139,9 +146,16 @@ pub struct SlotWriter<'a, K: Key, T> {
     key: K,
 }
 impl<K: Key, T> SlotWriter<'_, K, T> {
+    /// 返回预定键的副本；调用 insert 前该键尚不可读取值。
+    pub fn key(&self) -> K {
+        self.key
+    }
+
+    /// 以默认 link=0 提交值并返回该键。
     pub fn insert(self, value: T) -> K {
         self.insert_with_link(value, 0)
     }
+    /// 提交值及用户 link，并返回该键。提交后其他线程可经同步读取值。
     pub fn insert_with_link(mut self, value: T, link: u64) -> K {
         // SAFETY: candidate exclusively owns uninitialized T, all callbacks done.
         unsafe { ptr::write(self.candidate.slot.value_ptr(), value) };
@@ -197,9 +211,11 @@ impl<K: Key, T> Drop for SlotMap<K, T> {
     }
 }
 impl<K: Key, T> SlotMap<K, T> {
+    /// 创建空槽表，不预分配槽位。
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
+    /// 按给定容量创建空槽表；超过支持的索引范围时 panic。
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(
             capacity <= MAX_ENTRIES,
@@ -302,7 +318,12 @@ impl<K: Key, T> SlotMap<K, T> {
             }
         }
     }
-    pub fn try_reserve_if(
+    /// 认领一个空槽并返回写入者；仅分配新索引时调用 predicate。
+    ///
+    /// 空闲槽复用不经过 predicate。返回 IndexRejected 表示新索引被拒绝，
+    /// IndexExhausted 表示索引已耗尽。放弃写入者会消耗该槽的一代版本；
+    /// 对新索引，放弃写入者后高水位不会回退，即使值尚未插入。
+    pub fn try_insert_if(
         &self,
         predicate: impl FnMut(u32) -> bool,
     ) -> Result<SlotWriter<'_, K, T>, ReserveError> {
@@ -310,30 +331,60 @@ impl<K: Key, T> SlotMap<K, T> {
         let key = checked_key(candidate.index, candidate.version);
         Ok(SlotWriter { candidate, key })
     }
+    /// 通过共享引用插入值并返回键；无可用槽位时 panic。
     pub fn insert(&self, value: T) -> K {
         self.insert_with_link(value, 0)
     }
+    /// 先将预定键传给闭包构造值，再提交到槽位。
+    ///
+    /// 闭包执行期间键尚未存活，不能通过它读取值；闭包 panic 时不提交值，
+    /// 但已认领槽位会消耗一代版本。索引耗尽时 panic。
+    pub fn insert_with_key(&self, f: impl FnOnce(K) -> T) -> K {
+        let writer = self.try_insert_if(|_| true)
+            .unwrap_or_else(|_| panic!("SlotMap index limit exhausted"));
+        let value = f(writer.key);
+        writer.insert(value)
+    }
+    /// 将预定键传给闭包；成功时插入值并返回键，闭包报错时返回原错误。
+    ///
+    /// 闭包报错时不提交值，但会消耗一代版本，并可能推进新索引的高水位；
+    /// 索引耗尽时与 insert 一样 panic，而不是返回 E。
+    pub fn try_insert_with_key<E>(
+        &self,
+        f: impl FnOnce(K) -> Result<T, E>,
+    ) -> Result<K, E> {
+        let writer = self.try_insert_if(|_| true)
+            .unwrap_or_else(|_| panic!("SlotMap index limit exhausted"));
+        let value = f(writer.key)?;
+        Ok(writer.insert(value))
+    }
+    /// 插入值并设置用户 link；无可用槽位时 panic。
     pub fn insert_with_link(&self, value: T, link: u64) -> K {
-        self.try_reserve_if(|_| true)
+        self.try_insert_if(|_| true)
             .unwrap_or_else(|_| panic!("SlotMap index limit exhausted"))
             .insert_with_link(value, link)
     }
+    /// 尝试插入值，失败时返回未消耗的原值。
     pub fn alloc(&self, value: T) -> Result<K, T> {
         self.alloc_with_link(value, 0).map_err(|(value, _)| value)
     }
+    /// 尝试插入值和 link，失败时返回两项原输入。
     pub fn alloc_with_link(&self, value: T, link: u64) -> Result<K, (T, u64)> {
-        match self.try_reserve_if(|_| true) {
+        match self.try_insert_if(|_| true) {
             Ok(writer) => Ok(writer.insert_with_link(value, link)),
             Err(_) => Err((value, link)),
         }
     }
+    /// insert 的独占引用别名；不替换已有键对应的值。
     pub fn set(&mut self, value: T) -> K {
         self.insert(value)
     }
+    /// insert_with_link 的独占引用别名。
     pub fn set_with_link(&mut self, value: T, link: u64) -> K {
         self.insert_with_link(value, link)
     }
-    /// O(max) version scan, not a consistent concurrent snapshot. No key callbacks.
+    /// 扫描存活版本计数，复杂度 O(max)；并发时不是一致性快照。
+    /// 不调用键类型的回调。
     pub fn len(&self) -> usize {
         self.slots
             .segments(0..self.max() as usize)
@@ -341,17 +392,21 @@ impl<K: Key, T> SlotMap<K, T> {
             .filter(|slot| live(slot.version.load(Ordering::Acquire)))
             .count()
     }
+    /// 判断槽表是否为空；同 len 一样需要扫描，并发时不是一致性快照。
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     #[cfg(feature = "stats")]
+    /// 返回累计成功插入次数；仅启用 stats 时可用，计数可能回绕。
     pub fn alloc_count(&self) -> usize {
         self.alloc.load(Ordering::Relaxed)
     }
     #[cfg(feature = "stats")]
+    /// 返回累计成功删除次数；仅启用 stats 时可用，计数可能回绕。
     pub fn free_count(&self) -> usize {
         self.free.load(Ordering::Relaxed)
     }
+    /// 返回已认领新索引的高水位；删除不会降低该值。
     pub fn max(&self) -> u32 {
         self.next_index.load(Ordering::Acquire)
     }
@@ -362,11 +417,13 @@ impl<K: Key, T> SlotMap<K, T> {
         let slot = self.slots.get(data.index() as usize)?;
         (slot.version.load(Ordering::Acquire) == data.version()).then_some(slot)
     }
+    /// 用键查询存活值及其用户 link；键无效或已删除时返回 None。
     pub fn get(&self, key: K) -> Option<(&T, &ShareU64)> {
         let slot = self.find(key.data())?;
         // SAFETY: LIVE Acquire observes T; safe removal needs exclusive map.
         Some((unsafe { &*slot.value_ptr() }, &slot.link))
     }
+    /// 独占借用存活值及其用户 link；键无效或已删除时返回 None。
     pub fn get_mut(&mut self, key: K) -> Option<(&mut T, &mut ShareU64)> {
         let data = key.data();
         self.find(data)?;
@@ -377,25 +434,31 @@ impl<K: Key, T> SlotMap<K, T> {
             &mut slot.link,
         ))
     }
+    /// 通过共享引用取得值的可变引用和 link 的共享引用。
+    ///
     /// # Safety
-    /// T must be exclusively borrowed; all returned references must end before
-    /// removal, reuse or destruction. External synchronization is required.
+    /// 调用者必须排除目标 T 的所有冲突访问，且在删除、复用或销毁前终止
+    /// 返回的全部引用；跨线程使用时必须自行同步。
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_shared(&self, key: K) -> Option<(&mut T, &ShareU64)> {
         let slot = self.find(key.data())?;
         // SAFETY: caller excludes conflicting T accesses; permanent link shared.
         Some((unsafe { &mut *slot.value_ptr() }, &slot.link))
     }
+    /// 不验证键的边界和版本，返回值及 link 的共享引用。
+    ///
     /// # Safety
-    /// Valid initialized LIVE key; no conflicting mutation/removal until refs end.
+    /// 键必须属于本表的已初始化存活槽；引用存活期间不得冲突修改或删除。
     pub unsafe fn get_unchecked(&self, key: K) -> (&T, &ShareU64) {
         // SAFETY: valid LIVE key required by caller.
         let slot = unsafe { self.slots.get_unchecked(key.data().index() as usize) };
         slot.version.load(Ordering::Acquire);
         (unsafe { &*slot.value_ptr() }, &slot.link)
     }
+    /// 不验证键的边界和版本，返回值及 link 的可变引用。
+    ///
     /// # Safety
-    /// Valid initialized LIVE key in this exclusively borrowed map.
+    /// 键必须属于本表的已初始化存活槽；调用者须持有表的独占借用。
     pub unsafe fn get_unchecked_mut(&mut self, key: K) -> (&mut T, &mut ShareU64) {
         // SAFETY: caller supplies valid key, map is exclusive.
         let slot = self
@@ -404,28 +467,36 @@ impl<K: Key, T> SlotMap<K, T> {
             .expect("valid LIVE key");
         unsafe { (slot.entry.get_mut().assume_init_mut(), &mut slot.link) }
     }
+    /// 不验证键的边界和版本，取得共享表中的可变值引用。
+    ///
     /// # Safety
-    /// Valid LIVE key and the complete get_shared exclusivity/lifetime contract.
+    /// 除键必须有效且存活外，还须满足 get_shared 的全部排他和引用生命周期前提。
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_shared_unchecked(&self, key: K) -> (&mut T, &ShareU64) {
         let slot = unsafe { self.slots.get_unchecked(key.data().index() as usize) };
         slot.version.load(Ordering::Acquire);
         (unsafe { &mut *slot.value_ptr() }, &slot.link)
     }
+    /// 删除存活键并返回值；键无效时返回 None。调用需要独占借用表。
     pub fn remove(&mut self, key: K) -> Option<T> {
         unsafe { self.remove_shared(key) }
     }
+    /// 删除存活键并返回值及用户 link 的当前快照；键无效时返回 None。
     pub fn remove_with_link(&mut self, key: K) -> Option<(T, u64)> {
         unsafe { self.remove_shared_with_link(key) }
     }
+    /// 通过共享引用删除存活键并返回值；键无效时返回 None。
+    ///
     /// # Safety
-    /// All target T/link references must have ended; exclude conflicting access
-    /// and scans, synchronize across threads. Internal late FREE observers allowed.
+    /// 目标 T 和 link 的所有引用必须已终止；调用者须排除冲突的访问和扫描，
+    /// 跨线程还须自行同步。内部迟到的空闲链观察者由实现处理。
     pub unsafe fn remove_shared(&self, key: K) -> Option<T> {
         unsafe { self.remove_shared_with_link(key) }.map(|(value, _)| value)
     }
+    /// 通过共享引用删除键并返回值及用户 link 快照。
+    ///
     /// # Safety
-    /// Same exclusivity and ended-reference contract as remove_shared.
+    /// 与 remove_shared 相同：目标引用均已终止且不存在冲突访问或扫描。
     pub unsafe fn remove_shared_with_link(&self, key: K) -> Option<(T, u64)> {
         let data = key.data();
         let slot = self.find(data)?;
@@ -449,14 +520,20 @@ impl<K: Key, T> SlotMap<K, T> {
         self.free.fetch_add(1, Ordering::Relaxed);
         Some((value, link))
     }
+    /// 替换存活键的值并返回旧值；无效键返回未消耗的新值。
+    /// 不改变键的版本和用户 link。
     pub fn replace(&mut self, key: K, value: T) -> Result<T, T> {
         unsafe { self.replace_shared(key, value) }
     }
+    /// 同时替换值与用户 link；失败时返回未消耗的新值及 link。
+    /// 成功时返回旧值及旧 link 快照，不改变键的版本。
     pub fn replace_with_link(&mut self, key: K, value: T, link: u64) -> Result<(T, u64), (T, u64)> {
         unsafe { self.replace_shared_with_link(key, value, link) }
     }
+    /// 通过共享引用替换存活键的值；失败时返回原新值。
+    ///
     /// # Safety
-    /// Exclude all conflicting T references, mutation, deletion and scanning.
+    /// 必须排除目标 T 的冲突引用、修改、删除与扫描。
     pub unsafe fn replace_shared(&self, key: K, value: T) -> Result<T, T> {
         let Some(slot) = self.find(key.data()) else {
             return Err(value);
@@ -464,9 +541,11 @@ impl<K: Key, T> SlotMap<K, T> {
         // SAFETY: caller ensures initialized T is exclusively accessed.
         Ok(unsafe { ptr::replace(slot.value_ptr(), value) })
     }
+    /// 通过共享引用同时替换值与用户 link；失败时返回原输入。
+    ///
     /// # Safety
-    /// replace_shared contract plus no concurrent user link operations. Late
-    /// internal FREE observers may still load the permanent link's arbitrary bits.
+    /// 除 replace_shared 的排他前提外，不得有并发的用户 link 操作；
+    /// 内部迟到的空闲链观察者仍可能读取 link 的任意位。
     pub unsafe fn replace_shared_with_link(
         &self,
         key: K,
@@ -481,6 +560,8 @@ impl<K: Key, T> SlotMap<K, T> {
         slot.link.store(link, Ordering::Relaxed);
         Ok((old, old_link))
     }
+    /// 按索引顺序遍历存活槽，返回键、值及用户 link 的共享引用。
+    /// 并发插入时不保证是同一时刻的快照；删除须遵守独占借用要求。
     pub fn iter(&self) -> Iter<'_, K, T> {
         Iter {
             map: self,
@@ -488,6 +569,7 @@ impl<K: Key, T> SlotMap<K, T> {
             end: self.max(),
         }
     }
+    /// 独占遍历存活槽，返回键、值及用户 link 的可变引用。
     pub fn iter_mut(&mut self) -> IterMut<'_, K, T> {
         IterMut {
             slots: self.slots.slice_mut(0..self.max() as usize),
@@ -511,6 +593,7 @@ impl<K: Key, T: Debug> Debug for SlotMap<K, T> {
         formatter.debug_map().entries(self.iter()).finish()
     }
 }
+/// 按索引扫描存活槽的共享迭代器；元素为 (K, (&T, &ShareU64))。
 pub struct Iter<'a, K: Key, T> {
     map: &'a SlotMap<K, T>,
     next: u32,
@@ -536,6 +619,7 @@ impl<'a, K: Key, T> Iterator for Iter<'a, K, T> {
         (0, Some((self.end - self.next) as usize))
     }
 }
+/// 独占遍历存活槽的迭代器；元素为 (K, (&mut T, &mut ShareU64))。
 pub struct IterMut<'a, K: Key, T> {
     slots: pi_arr::IterMut<'a, Slot<T>>,
     borrow: PhantomData<&'a mut SlotMap<K, T>>,

@@ -1,6 +1,26 @@
 # pi_slot
 
-版本化槽表 SlotMap<K: Key = DefaultKey, T = ()>。
+支持通过共享引用并发插入的版本化槽表 SlotMap<K: Key = DefaultKey, T = ()>。
+这不代表值可以并发修改或删除：安全删除与可变访问需要独占借用；
+共享引用上的删除、修改仅在调用者满足对应 unsafe 前提时可用。
+
+## 快速使用
+
+~~~rust
+use pi_slot::{DefaultKey, SlotMap};
+
+let mut map = SlotMap::<DefaultKey, (DefaultKey, u32)>::new();
+let writer = map.try_insert_if(|index| index < 10).unwrap();
+let key = writer.key(); // 尚未提交，map.get(key) 为 None。
+let inserted = writer.insert((key, 42));
+assert_eq!(inserted, key);
+assert_eq!(map.get(key).unwrap().0, &(key, 42));
+assert_eq!(map.remove(key), Some((key, 42)));
+~~~
+
+也可以用 insert_with_key(|key| ...) 构造含自身键的值；
+try_insert_with_key(|key| -> Result<T, E> { ... }) 可返回业务错误。
+后者失败时不会发布值，但已认领的槽位会消耗一代版本；索引耗尽时会 panic。
 
 ## 精确布局
 
@@ -14,7 +34,7 @@ struct Slot<T> {
 }
 struct SlotMap<K: Key, T> {
     free_head: ShareU64,
-    slots: SegmentedArr<Slot<T>>,
+    slots: Arr<Slot<T>>,
     #[cfg(feature = "stats")]
     alloc: CachePadded<ShareUsize>,
     #[cfg(feature = "stats")]
@@ -42,8 +62,11 @@ FREE link 是下一节点完整 index32/version32 标识，NULL=u32::MAX as u64�
 | iter / iter_mut | (K, (&T, &ShareU64)) / (K, (&mut T, &mut ShareU64)) |
 | Index / IndexMut | 只返回 T；无效键 panic |
 | insert / insert_with_link / set / set_with_link | 返回 K，默认 link=0；set 为独占别名 |
+| insert_with_key | 将预定 K 传给 FnOnce(K) -> T，提交后返回 K；键在回调期间尚未 LIVE |
+| try_insert_with_key | 将预定 K 传给 FnOnce(K) -> Result<T,E>，返回 Result<K,E>；Err 不提交值但消耗 generation；索引耗尽会 panic |
 | alloc / alloc_with_link | Result<K,T> / Result<K,(T,u64)>，耗尽保留原输入 |
-| try_reserve_if | Result<SlotWriter,ReserveError>；FREE 复用跳过 predicate |
+| try_insert_if | 按 predicate 认领新索引，返回 Result<SlotWriter,ReserveError>；FREE 复用跳过 predicate；放弃 writer 消耗 generation |
+| SlotWriter::key / insert / insert_with_link | 提交前读取预定 K；提交时设置值与可选 link（默认 0），返回同一 K |
 | remove / remove_with_link | Option<T> / Option<(T,u64)> |
 | unsafe remove_shared / remove_shared_with_link | 同上，调用方证明引用终止与排他 |
 | replace / replace_with_link | 返回旧值/旧位，失败保留新输入，generation 不变 |
