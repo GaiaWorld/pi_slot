@@ -14,12 +14,11 @@ categories = ["data-structures", "memory-management", "caching"]
 [dependencies]
 pi_arr = "0.32"
 pi_share = "2.1"
-crossbeam-utils = { version = "0.8", optional = true }
+crossbeam-utils = "0.8"
 pi_key = "0.3"
 
 [features]
 default = []
-stats = ["dep:crossbeam-utils"]
 rc = ["pi_share/rc", "pi_arr/rc"]
 
 [dev-dependencies]
