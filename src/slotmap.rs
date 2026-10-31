@@ -36,7 +36,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
-use std::ptr;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 // 新索引的排他上限；保留原有边界余量。
@@ -63,47 +63,32 @@ unsafe impl<T: Send + Sync, const N: u32> Sync for Slot<T, N> where (T, ShareU32
 impl<T, const N: u32> Slot<T, N> {
     // self 可未初始化；返回值存储的裸指针，解引用前必须另证 LIVE 与排他条件。
     fn value_ptr(&self) -> *mut T {
-        self.entry.get().cast::<T>()
+        inner::slot_value_ptr(self)
     }
 }
 impl<T, const N: u32> Default for Slot<T, N> {
     // 返回版本为零、link 为空、T 尚未初始化的槽，不构造 T。
     fn default() -> Self {
-        Self {
-            link: ShareU64::new(NULL),
-            entry: UnsafeCell::new(MaybeUninit::uninit()),
-            version: ShareU32::new(0),
-        }
+        inner::slot_default()
     }
 }
 impl<T, const N: u32> Drop for Slot<T, N> {
     // self 为最终独占槽；先清 LIVE 再析构值，析构 panic 时字段仍由 drop glue 清理。
     fn drop(&mut self) {
-        if live::<N>(*self.version.get_mut()) {
-            *self.version.get_mut() &= !(1u32 << N);
-            // SAFETY: 最终独占所有者且 LIVE 证明已初始化；先撤销占用避免重复析构。
-            unsafe { self.entry.get_mut().assume_init_drop() };
-        }
+        inner::slot_drop(self)
     }
 }
 // version 为完整版本，N 必须小于 32；返回占用位是否置位，不修改状态。
 fn live<const N: u32>(version: u32) -> bool {
-    version & (1u32 << N) != 0
+    inner::live::<N>(version)
 }
 // index 为槽索引，version 为完整版本；返回高版本、低索引的 64 位空闲链标识。
 fn encode(index: u32, version: u32) -> u64 {
-    (u64::from(version) << 32) | u64::from(index)
+    inner::encode(index, version)
 }
 // index 与 version 组成完整键；返回无损的 K，转换不保留任一部分时 panic。
 fn checked_key<K: Key>(index: u32, version: u32) -> K {
-    let data = KeyData::new(index, version);
-    let key = K::from(data);
-    assert_eq!(
-        key.data(),
-        data,
-        "SlotMap Key must preserve both index and version"
-    );
-    key
+    inner::checked_key(index, version)
 }
 
 /// 可通过共享引用插入的版本化槽表。键由 32 位索引和 32 位版本组成。
