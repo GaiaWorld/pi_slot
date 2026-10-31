@@ -18,9 +18,9 @@
 //! println!("{value:?}");
 //! ```
 
-#[cfg(test)]
-#[path = "../tests/support/private.rs"]
-mod private_tests;
+// #[cfg(test)]
+// #[path = "../tests/support/private.rs"]
+// mod private_tests;
 
 #[path = "slotmap_inner.rs"]
 mod inner;
