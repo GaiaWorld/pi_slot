@@ -4,9 +4,11 @@
 
 底层壳 src/slotmap.rs 配对 src/slotmap_inner.rs（slotmap::inner），封装壳 src/guarded.rs 配对子模块 src/guarded_inner.rs。两芯零依赖；封装层只经 SlotMap 与 ClaimedSlot 壳交互。中文逐字段/参数/失败契约及算法伪码单源在源码，术语见 concepts.md。
 
+本轮实际检查：`cargo fmt --all -- --check`、`cargo check --all-targets`、`cargo check --all-targets --features rc` 均通过；`cargo test` 默认 debug 通过 80 项（21 unit + 14 guarded + 1 types + 35 slot_map + 9 doc），`cargo test --features rc` debug 通过 73 项（20 + 11 + 1 + 32 + 9）；均无 warning，测试 0 failed、0 ignored。原始输出保留于本轮工具记录，本轮未运行 release 或 TSan；业务 bits CAS 临界窗口定点验收尚未落实。
+
 ## 范围与已确认决定
 
-设计阶段仅写类型、契约、真实薄委托与显式 todo!("尚未实现…")，当时所有新增方法（含 guard Drop）均为不可执行的失败桩，依赖与 Cargo.toml 当时不改。当前全部 30 桩已实现；底层已有功能除明确移除 set_key_bits 外保留，普通 get 等继续完整 version 匹配。当前验证状态见文末。
+元数据 CAS 与独占守卫均已有运行实现。底层已有功能除明确移除 set_key_bits 外保留，普通 get 等继续完整 version 匹配；实现存在不代表全部验收时点已覆盖，缺口见下文。
 
 固定 nightly-2026-08-17、minimal profile；开启 generic_const_exprs 与其必要的 incomplete_features 接受。GuardedSlotMap<K,T,const N:u32=2> 私有 inner: SlotMap<K,T,{N+1}>，where [();(N+1) as usize]:；构造时校验 N<=30。N 是业务位数，CLAIMED 位 N，LIVE 位 N+1。业务 Ready/Empty 不属于库。位布局、回绕与跨表身份限制见 concepts.md。
 
@@ -14,37 +16,18 @@
 
 ## 声明闭包与技术路径
 
-- SlotMap::compare_exchange_bits 替代已移除 set_key_bits 及其旧芯：忽略键低保留位，显式 expected/new bits 对完整版本单次强 CAS；成功 AcqRel，失败 Acquire，同代 Mismatch/身份 Stale。仅元数据，不授予 T 权限。所有 K::data/from/无损校验回调（包括可重入 data）在修改前完成并缓存返回键，CAS 失败后无新用户回调。
-- 封装 compare_exchange_bits 的两端 CLAIMED=0，不能清其他 guard 占用；错误为 Stale / 同代 Busy / 未占用 BitsMismatch，Busy 优先。所有失败与键回调 panic 不得意外认领或写状态。
-- try_get 通过新增最小 pub(crate) SlotMap::claim_metadata，底层返回独立 ClaimMetadataError（Stale/Claimed/BitsMismatch），封装芯负责映射为 GuardedAccessError（Stale/Busy/BitsMismatch），actual_bits 原样保留；底层不引用 guarded。映射入口与认领入口现已实现。成功 CAS 后取得 ClaimedSlot 令牌才可生成引用。令牌保存稳定 Slot 引用、index、成功完整 version，不含 K、不自引用；guard 保存 map 引用、预校验 K、Option 令牌、原/最终 bits、Cell marker。None 表示 remove 已消费认领。
-- ClaimedSlot 的 value/value_mut、link/set_link、release/remove 是底层壳接口，芯已实现；借用绑定令牌借用。令牌字段私有，安全前提要求认领有效、目标引用结束且删除时使用同一表。release/remove 不重新查键，不能回调用户、分配、可 panic 断言；归链使用已验证槽/索引。没有将私有表示伪装重导出来跨芯调用。
-- SlotGuard 借用绑定 value/value_mut，不暴露 link 引用；link 只原子快照/set。original_bits 不变，bits 为待发布值，set_bits 只改待发布。Drop 经令牌 Release 发布最终业务位、清 CLAIMED；panic 不回滚已改值/link。forget 永久占用不自动解锁复用，最终 map Drop 仍析构 LIVE 值。Cell marker 保持 !Sync，Send 由真实字段推导，无手写 auto trait。
-- remove(self) 消费令牌，移出 T/link 后下一代 FREE 归链并计数；try_remove 复用同一 claim/removal 协议。try_update 为 for<'g,'m> FnOnce(&'g mut SlotGuard<'m,...>)->R，R 不依赖任何 guard 借用，成功后一次回调，不自动 retry。
-- SlotMap::insert_with_bits(bits,link,f) 是发布前初始化的最小内部入口；KeyData 回调预计算外部清位身份 K 并构造 T，覆盖初始完整 bits/link 后才发布 LIVE，FREE 历史 bits 不泄漏。回调/键转换失败消耗预定代际，不产生成功假象；insert_with_key 满足已知消费者自键构造。
+- **模块关系**：src/guarded.rs 定义封闭访问面与 GuardedAccessError；src/guarded_inner.rs 仅经 src/slotmap.rs 的 SlotMap、ClaimedSlot 壳协作。底层 ClaimMetadataError 不依赖封装业务类型，错误映射归封装层，私有表示不穿越芯边界。
+- **封闭访问与令牌边界**：GuardedSlotMap 的私有底层表不对外转换；SlotMap::compare_exchange_bits 只处理元数据，SlotMap::claim_metadata 才授予 ClaimedSlot 认领令牌。令牌字段私有且不含 K，SlotGuard 管理其所有权，值借用不能越过 guard；ClaimedSlot 的释放/删除安全前提及 SlotGuard 的字段不变量以源码声明为准。
+- **协作入口**：插入经 SlotMap::insert_with_bits；访问经 GuardedSlotMap::try_get 与 ClaimedSlot::value/value_mut；释放及删除经 ClaimedSlot::release/remove。GuardedSlotMap::try_remove、GuardedSlotMap::try_update 复用认领边界。各方法核心流程仅保留在对应源码壳注释。
+- **取舍**：以封闭访问和一次认领失败返回换取明确的独占责任，不引入扫描裸引用、自动重试或泄漏 guard 恢复入口。元数据令牌把无用户键回调的释放责任与可重入键转换分离；link 使用快照/原子写而非可变原子引用，以兼容迟到 FREE pop。有限版本位仍保留完整代际循环的 ABA 边界，未扩展为永久身份保证。
 
-## 转换审查边界与参照
+## 历史证据来源
 
-旧实现转换已获独立 convert 复审通过；该通过范围为新增设计之前的源码及对应证据，不自动覆盖后续新增接口与实现。conversion-before.json、conversion-check.json、baseline.json 保留原转换参照与结果，本轮不重写。baseline 来源是主对话/前序代理转换前实际运行结果。
-
-原基线：默认 13 unit + 33 integration + 3 doc；rc 12 + 30 + 3 全过。当时新增设计的证据单独写入 design-check.json，不能混称当时新增功能已可用；该文件保留为历史设计证据，不能代表当前实现新鲜度。
-
-## 设计阶段暂停记录与保留验收
-
-设计阶段曾将 5 个原测试逐点替换为 CAS 场景并标记 ignore，仅因当时实际会执行新 CAS 桩（当前均已恢复运行）：
-
-1. reserved_bits_are_strict_preserved_and_visible_to_iteration
-2. zero_bits_and_invalid_n_are_checked
-3. high_n_wraps_with_bits_and_writer_rollback
-4. compact_orders_free_slots_without_moving_live_values
-5. shrinking_preserves_keys_values_links_and_statistics
-
-当时新增 1 个暂停验收 bits_cas_key_callbacks_cannot_overwrite_reentrant_changes_or_panic_mutations，覆盖 Key::from/data 重入改变 bits 导致 Mismatch、回调 panic 不修改状态。当时合计默认/rc 均 6 个 ignore，保留原维护、回绕、link/值/统计断言，并新增同代显式 expected、忽略 key bits 与 Stale 断言。原非法 N 断言拆入 invalid_n_is_rejected_without_executing_design_stubs 继续运行，没有删除风险覆盖。
-
-设计阶段 tests/guarded_types.rs 定义非执行函数验证 N+1 泛型、N=0/30、默认 N、try_update HRTB 正向调用与默认原子下 guard Send；仅运行获取函数项的测试，不调用任何设计桩。Rustdoc 新增 1 个 no_run 与 5 个 compile_fail：共享/可变引用不可逃逸 guard 或 try_update，guard !Sync；加原 3 个 doc 共 9 个。无桩 panic 充当验收成功。
+转换参照与旧基线来自 conversion-before.json、conversion-check.json、baseline.json 及前序实际命令记录；design-check.json 保留设计轮次原始命令、退出码与文件指纹。当时新增入口为失败桩，相关测试曾暂停、存在未消费声明的 dead_code 警告，检查 API 导入受阻后以获授权的 bash 记录事实；后续实现已替换桩并恢复暂停测试。旧 convert/design 独立复审及既有 debug/release、mutation 检查只证明各自当时范围，不代表当前实现或全部验收的新鲜证据；历史 JSON 保持原样。
 
 ## Guarded 行为验收设计与风险分工
 
-以下保留原实现后验收方案；这些行为验收当前已落实，设计阶段当时未编写或执行这些业务测试。主要经 src/guarded.rs 的真实公开 GuardedSlotMap / SlotGuard 壳验证，不用私有测试替代跨调用语义。默认原子配置运行跨线程编排；rc 配置按同样状态序列单线程执行，不强行赋予其 Sync。类型约束继续由现有 tests/guarded_types.rs 与 no_run/compile_fail 覆盖。
+以下十组公开行为验收已有 tests/guarded.rs 对应用例，保留具体编排与可观察断言作为验收要求；这不代表下述私有临界窗口需求全部落实。主要经 src/guarded.rs 的真实公开 GuardedSlotMap / SlotGuard 壳验证，不用私有测试替代跨调用语义。默认原子配置运行跨线程编排；rc 配置按同样状态序列单线程执行，不强行赋予其 Sync。类型约束继续由现有 tests/guarded_types.rs 与 no_run/compile_fail 覆盖。
 
 ### 公开入口的编排与可观察断言
 
@@ -61,17 +44,14 @@
 
 ### 私有确定性测试仅补公开不可控制的时点
 
-- tests/support/private.rs 接于 slotmap 模块，仅为 SlotMap::claim_metadata、SlotMap::compare_exchange_bits 及 ClaimedSlot::release/remove 稳定制造“已读取版本而 CAS 前被改变”的调度，断言失败分类取自 CAS 实际返回版本、零额外认领和无自动重试。使用实现期测试专用屏障/钩子控制时点，不向公开 API 增加调试或原子引用出口；Guarded 端到端错误映射仍由上述公开用例验证。
-- 通过确定性暂停点覆盖 ClaimedSlot::remove 的移出、下一代 FREE、归链、删除计数顺序，以及迟到 FREE pop 在 LIVE 用户 link 上的读取。断言只有预校验完整 id 能发布、next 未提前解引用、释放/归链区间无 Key 回调和 T 析构，FREE 只归链一次、旧 token 不再发布。公开测试只断言最终所有权/复用结果，不能声称靠压力测试已证明这些中间顺序。
-- 仅在公开无法以合理周期达到的 N=0 代际回绕附近注入底层元数据状态，补掩码/回绕运算和 Stale 边界；不把它解释为超出既定完整代际 ABA 支持边界的保证。沿用既有有效私有断言，不逐私有函数凑测试。
-- 运行证据分开记录：类型检查证明签名/借用约束，公开行为验收证明跨调用可观察契约，私有定点测试证明协议中间时点；任何一层通过都不能替代另两层。设计阶段这些新增行为当时均为桩，以上当时仅为验收设计；当前实现与测试结论见下节。
+- **已落实的认领窗口**：src/slotmap_inner_test.rs 的 claim_cas_failure_reports_actual_* 用例通过 Stage::ClaimBeforeCas / ClaimCasFailed 控制 SlotMap::claim_metadata 预读版本到强 CAS 的窗口，覆盖占用、bits 改变与删除复用，断言按 CAS 实际返回版本分类、零额外认领且不重试。ClaimBeforeCas 仅接在 claim_metadata，不覆盖业务 bits CAS。
+- **尚未落实的底层业务 bits CAS 临界窗口验收**：SlotMap::compare_exchange_bits 不预读槽版本，需确定性控制全部键回调完成、目标槽定位之后到强 CAS 之前的窗口，分别插入同代 bits 改变、CLAIMED 占用与删除/复用；断言依据 CAS 返回版本得到 Mismatch（含实际低位，供封装映射 Busy）或 Stale、失败不覆盖新状态且无重试。当前没有该入口的 CAS 临界窗口定点测试；键回调重入发生在更早阶段，不能替代此验收。后续测试须使用内部测试专用钩子/屏障，不增加公开调试或原子引用出口，Guarded 错误映射仍须公开用例验证。
+- **已落实的删除/摘链窗口**：src/slotmap_inner_test.rs 通过确定性暂停点覆盖 ClaimedSlot::remove 的移出、下一代 FREE、归链、删除计数顺序，以及迟到 FREE pop 在 LIVE 用户 link 上的读取。断言只有预校验完整 id 能发布、next 未提前解引用、释放/归链区间无 Key 回调和 T 析构，FREE 只归链一次、旧 token 不再发布。公开测试只断言最终所有权/复用结果，不能声称靠压力测试已证明这些中间顺序。
+- **已落实的回绕定点**：tests/support/private.rs 的 guarded_zero_business_bits_last_generation_claim_release_remove_wraps 仅在公开无法以合理周期达到的 N=0 代际回绕附近注入底层元数据状态，补掩码/回绕运算和 Stale 边界；不把它解释为超出既定完整代际 ABA 支持边界的保证。沿用既有有效私有断言，不逐私有函数凑测试。
+- 运行证据分开记录：类型检查证明签名/借用约束，公开行为验收证明跨调用可观察契约，私有定点测试证明协议中间时点；任何一层通过都不能替代另两层。已落实测试与待补业务 CAS 窗口须分别评价，不能以当前全套测试通过声称全部验收已完成。
 
-## 当前检查状态与未决
+## 当前检查与未决
 
-历史设计轮次执行了 cargo fmt、cargo fmt -- --check、cargo check --all-targets（默认与 --features rc）、cargo test（两配置，仅未 ignore 用例）；更早轮次的 cargo test --no-run 编译覆盖未冒充该轮新执行。该轮原始命令、退出码与 normalized LF 文件指纹写入 design-check.json。checkRound 当时导入被工具依赖解析阻断，后用已获授权的 bash 后备记录事实。当时私有字段/接口未被桩消费，存在 dead_code 警告；这些记录保留历史语态，design-check.json 不重写，也不能代表当前实现新鲜度。
+本轮限定为注释、文档及类型测试名称说明的自修；实际检查结果汇总在文首。十组公开行为验收的现有测试、认领/删除/摘链及回绕定点测试均有源码落点；底层 SlotMap::compare_exchange_bits 的 CAS 临界窗口确定性验收仍待补，不能称全部已测。
 
-原独立审查会话已明确：完整范围 design 独立复审通过，13 个文件指纹匹配；底层反向依赖与 Guarded 行为验收设计不足两项原阻塞均已闭合，无已知未闭合待设计项。此处记录独立复审结论，不是自审结论。
-
-设计阶段曾有 30 个显式桩（底层 9 个、Guarded 21 个）、6 项暂停验收与 20 项 dead_code 警告。当前 30 桩均已实现，暂停验收已恢复，上述行为验收已落实。最新已有默认 debug/release 各通过 80 项（21 unit + 14 guarded + 1 types + 35 slot_map + 9 doc），rc 各通过 73 项（20 + 11 + 1 + 32 + 9）；0 warning、0 ignored。独立功能静态审查无具体缺陷；测试审查最后的 len 读窗口已补齐，两种读序反转 mutation 在默认与 rc 下均实际失败后恢复。
-
-TSan 尚未验证：Windows 不支持，WSL disabled、Docker 不存在。scripts/test-tsan.sh 需要真实 Linux x86_64，插桩标准库与目标侧 Rust 依赖，在默认 debug/release 执行 --lib、guarded、slot_map，包含 timeout、严格 summary 校验及同步日志。现有实测仅为 bash -n 与 Windows 保护 exit 2，不能视为 TSan 通过。使用方式及环境边界见 README.md 的“验证”。
+TSan 尚未验证：当前 Windows 不支持。scripts/test-tsan.sh 须在具备所需工具的真实 Linux x86_64 上执行；脚本对标准库与目标侧 Rust 依赖插桩，默认配置 debug/release 运行 --lib、guarded、slot_map。既有 bash -n 与 Windows 保护退出码 2 仅为脚本/环境证据，不代表 TSan 通过；环境和执行方式见 README.md“验证”。

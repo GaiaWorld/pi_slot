@@ -424,10 +424,11 @@ impl<K: Key, T, const N: u32> SlotMap<K, T, N> {
         expected_bits: u32,
         new_bits: u32,
     ) -> Result<K, CompareExchangeBitsError> {
-        // 设计已确认：校验 bits → 提取身份并预计算/验证结果 K（全部用户回调在此完成）
-        // → 按索引读取当前完整版本，拒绝 FREE/代际不符为 Stale；
-        // 以身份+expected_bits 对完整 version 强 CAS 一次，成功返回预计算 K；
-        // 失败按 CAS 返回的版本区分 Stale 或同代 Mismatch，不再运行用户回调或重试。
+        // 设计已确认；伪码：校验 bits → 提取身份并预计算/验证结果 K（全部用户回调在此完成）；
+        // 身份不含 LIVE、索引达到或超过高水位或槽未分配则返回 Stale；不预读槽 version。
+        // 直接以身份|expected_bits → 身份|new_bits 对完整 version 强 CAS 一次（成功 AcqRel，失败 Acquire）；
+        // 成功返回预计算 K；失败仅按 CAS 返回版本分类：清低 N 位后等于身份则 Mismatch，
+        // actual_bits 为返回版本的低 N 位；否则 Stale。不再运行用户回调或重试。
         inner::map_compare_exchange_bits(self, key, expected_bits, new_bits)
     }
 

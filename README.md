@@ -1,6 +1,6 @@
 # pi_slot
 
-元数据 CAS 与 GuardedSlotMap/SlotGuard 的全部 30 个实现桩已完成，包括 guard Drop。当前实现与验证状态见下方“验证”。既有转换的独立 convert 复审结论保留为历史证据。
+提供元数据 CAS 与 GuardedSlotMap/SlotGuard 独占访问，包括 guard Drop 的状态发布。契约见 src/slotmap.rs、src/guarded.rs；测试证据与未验证边界见下方“验证”。
 
 使用固定 nightly-2026-08-17；新增泛型表达式依赖 generic_const_exprs，下游泛型调用需启用该 nightly feature 并携带 `[(); (N + 1) as usize]:` 约束。
 
@@ -117,7 +117,9 @@ SlotMap Drop 先撤销 LIVE、移出 T，逐值 catch_unwind 清理全部实际�
 
 ## 验证
 
-最新已有测试结果：默认配置在 debug、release 下各通过 80 项（21 unit + 14 guarded + 1 types + 35 slot_map + 9 doc）；rc 两种构建各通过 73 项（20 + 11 + 1 + 32 + 9），均为 0 warning、0 ignored。独立功能静态审查未发现具体缺陷；测试审查最后的 len 读窗口覆盖已补齐，两种读序反转 mutation 在默认与 rc 下均实际失败，随后已恢复。
+本轮实际运行 `cargo fmt --all -- --check`、默认及 rc 的 `cargo check --all-targets`，均通过；默认 `cargo test` debug 通过 80 项（21 unit + 14 guarded + 1 types + 35 slot_map + 9 doc），`cargo test --features rc` debug 通过 73 项（20 + 11 + 1 + 32 + 9），均无 warning、0 failed、0 ignored。本轮未运行 release；既有 release 与 mutation 结果仅为历史证据。
+
+现有公开行为用例与私有定点测试不等于全部并发时点已测：`ClaimBeforeCas` 仅用于 `claim_metadata`；底层 `SlotMap::compare_exchange_bits` 在键回调完成、定位槽后到强 CAS 前的临界窗口仍缺确定性测试，键回调重入不能替代它。十组行为验收、已落实测试与待补要求见 design/guarded-slot-map/design.md。
 
 TSan **尚未验证**：当前 Windows 不支持，WSL disabled、Docker 不存在。现有脚本仅实测了 `bash -n scripts/test-tsan.sh` 和 Windows 环境保护退出码 2，不能据此称 TSan 通过。须在真实 Linux x86_64（具备 rustup、cc 及脚本所需工具）执行 `bash scripts/test-tsan.sh`；脚本使用固定 nightly 与 `-Zbuild-std` 插桩标准库及目标侧 Rust 依赖，在默认配置 debug/release 下运行 `--lib`、`guarded`、`slot_map`，以超时、严格测试 summary 校验和同步日志确认执行，日志位于 `target/tsan/run-*`。
 

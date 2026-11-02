@@ -3,7 +3,7 @@
 
 use pi_slot::{DefaultKey, GuardedAccessError, GuardedSlotMap, SlotGuard, SlotMap};
 
-// 只定义函数、由编译器验证签名；没有 #[test]，不执行任何设计桩。
+// 以下辅助函数不直接作为测试执行，由编译器验证泛型签名与调用约束。
 fn generic_surface<const N: u32>(map: &GuardedSlotMap<DefaultKey, String, N>, key: DefaultKey)
 where
     [(); (N + 1) as usize]:,
@@ -34,7 +34,7 @@ fn atomic_send_capability() {
 
 // 保持这些类型检查函数可达，但仅获取函数项，不调用构造/访问/Drop。
 #[test]
-fn type_surface_is_compiled_without_executing_stubs() {
+fn type_surface_is_compiled_without_calling_helpers() {
     let _ = concrete_surface;
     #[cfg(not(feature = "rc"))]
     let _ = atomic_send_capability;

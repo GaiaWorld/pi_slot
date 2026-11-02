@@ -1,11 +1,11 @@
-//! 独占槽守卫的设计壳；新增方法尚未实现，不可运行。
+//! 封闭槽表与独占槽守卫；通过元数据认领控制值访问，具体实现委托给 guarded_inner。
 #[path = "guarded_inner.rs"]
 mod guarded_inner;
 use crate::slotmap::{ClaimedSlot, DefaultKey, Key, SlotMap};
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-/// 新增声明仅供编译检查；以下示例只编译不执行。
+/// 通过独占守卫访问值的封闭槽表；以下 no_run 示例展示泛型约束与调用方式。
 /// ```no_run
 /// #![feature(generic_const_exprs)]
 /// #![allow(incomplete_features)]
@@ -115,7 +115,7 @@ impl<K: Key, T, const N: u32> GuardedSlotMap<K, T, N>
 where
     [(); (N + 1) as usize]:,
 {
-    /// 返回未分配的空表；N 为业务位数，必须 <=30，否则 panic。当前是设计桩，不可执行。
+    /// 返回不预分配槽位的空表；N 为业务位数，必须 <=30，否则 panic。
     pub fn new() -> Self {
         guarded_inner::map_new::<K, T, N>()
     }
@@ -246,7 +246,7 @@ where
     [(); (N + 1) as usize]:,
 {
     /// 无返回值；令牌仍在时 Release 发布已校验 final_bits 并清 CLAIMED，不回滚值/link。
-    /// 正式实现禁止分配、断言、用户回调及 panic；remove 后 token=None 不操作。当前显式设计桩会 panic，严禁运行。
+    /// 释放路径不分配、不执行断言或用户回调，也不 panic；remove 后 token=None 不操作。
     fn drop(&mut self) {
         // 设计已确认；伪码：取出 token；无则返回；否则以令牌调用 release(final_bits)，不调用 Key 方法。
         guarded_inner::guard_drop(self)
